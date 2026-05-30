@@ -12,8 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from ...utils import logging
 from ...utils.plugin import BasePlugin
+
+
+if TYPE_CHECKING:
+    from ...config.arg_utils import PluginConfig
+    from ...utils.types import HFModel
+
+
+logger = logging.get_logger(__name__)
 
 
 class OptimizerPlugin(BasePlugin):
     pass
+
+
+@OptimizerPlugin("muon").register()
+def create_muon_optimizer(model: HFModel, optim_config: PluginConfig):
+    from ....third_party.muon import Muon
+
+    muon_params, adamw_params = [], []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.ndim == 2 and "embed" not in name and "lm_head" not in name:
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+    optimizer = Muon(
+        lr=optim_config.get("lr", 1e-3),
+        wd=optim_config.get("wd", 0.1),
+        muon_params=muon_params,
+        momentum=optim_config.get("momentum", 0.95),
+        nesterov=optim_config.get("nesterov", True),
+        ns_steps=optim_config.get("ns_steps", 5),
+        adamw_params=adamw_params,
+        adamw_betas=tuple(optim_config.get("adamw_betas", [0.9, 0.95])),
+        adamw_eps=optim_config.get("adamw_eps", 1e-8),
+    )
+    logger.info_rank0(
+        f"Using Muon optimizer with {len(muon_params)} Muon params and {len(adamw_params)} AdamW params."
+    )
+    return optimizer
