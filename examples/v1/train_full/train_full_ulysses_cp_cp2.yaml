@@ -7,8 +7,8 @@ template: qwen3_nothink
 flash_attn: flash_attention_2          # SP 强制要求 flash_attention_2
 
 # 用 meta 设备分块加载，避免每个 rank 都加载完整 8B (fp32 ~32GB) 导致加载阶段 OOM
-init_config:
-  name: init_on_meta
+#init_config:
+#  name: init_on_meta
 
 # Distribution / Sequence Parallel Config
 # world_size must be divisible by cp_size: dp_size = world_size // cp_size

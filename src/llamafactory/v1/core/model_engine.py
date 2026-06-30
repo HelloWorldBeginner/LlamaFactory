@@ -158,6 +158,9 @@ class ModelEngine:
 
         if init_device.type == DeviceType.META:
             assert self.args.quant_config is None, "Quantization is not supported with meta device."
+            # from_config does not accept `attn_implementation`; set it on the config so that
+            # flash-attention modules are instantiated and the SP gate (flash_attention_2) passes.
+            self.model_config._attn_implementation = self.args.flash_attn
             with init_empty_weights():
                 model = AutoClass.from_config(self.model_config)
         else:

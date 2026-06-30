@@ -20,6 +20,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import transformers
 
+from ....accelerator.helper import get_current_device
 from ....accelerator.interface import Dim, DistributedInterface
 from ....utils import logging
 from ....utils.plugin import BasePlugin
@@ -153,8 +154,11 @@ def padding_and_split_data(data, device_mesh=None):
 def sequence_parallel_loss(model, model_inputs):
     device_mesh = DistributedInterface().get_device_mesh(Dim.CP)
 
+    # Move tensors to the current accelerator device (e.g. npu:local_rank).
+    # `dist.get_rank()` returns an int rank; `Tensor.to(int)` is a dtype cast, not a device move.
+    current_device = get_current_device()
     model_inputs = {
-        k: v.to(dist.get_rank(), non_blocking=True) for k, v in model_inputs.items() if isinstance(v, torch.Tensor)
+        k: v.to(current_device, non_blocking=True) for k, v in model_inputs.items() if isinstance(v, torch.Tensor)
     }
 
     model_inputs = padding_and_split_data(model_inputs, device_mesh)

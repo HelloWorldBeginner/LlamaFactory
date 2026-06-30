@@ -67,6 +67,9 @@ def launch():
         if is_env_enabled("OPTIM_TORCH", "1"):
             # optimize DDP, see https://zhuanlan.zhihu.com/p/671834539
             env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            # NPU caching allocator reads a separate env var; mirror the CUDA setting so that
+            # fragmentation-driven OOM on Ascend NPU is also mitigated.
+            env["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
             env["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
 
         torchrun_args = [
