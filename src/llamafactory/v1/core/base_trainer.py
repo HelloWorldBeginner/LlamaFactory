@@ -217,8 +217,9 @@ class BaseTrainer:
         ``torch.nn.utils.clip_grad_norm_`` on FSDP2 DTensor params clips using a
         per-rank (local-shard) norm, so the clip coefficient differs by world_size
         (e.g. CP1 vs CP2 get different norms) and the updates diverge. Instead,
-        compute the global L2 norm by summing local squared norms and all-reducing
-        across all ranks, then clip every grad with the same global coefficient.
+        compute the global L2 norm via per-param ``pow(2).sum()`` (DTensor.sum
+        all-reduces Shard grads, no-op for Replicate) so it is identical across
+        world sizes, then clip every grad with the same global coefficient.
         Falls back to ``clip_grad_norm_`` for non-DTensor (e.g. DDP) grads.
         """
         try:
@@ -231,12 +232,17 @@ class BaseTrainer:
             return 0.0
 
         if DTensor is not None and isinstance(params_with_grad[0].grad, DTensor):
-            # FSDP2: grads are sharded DTensors. Sum local squared norms, all-reduce to global.
-            local_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            # Global L2 norm across the full FSDP2 mesh. Use p.grad.pow(2).sum() per param:
+            # DTensor.sum() all-reduces sharded (Shard) grads to a global scalar and is a no-op
+            # for replicated (Replicate) grads, so the result is consistent across world sizes.
+            # Do NOT use to_local() + manual all_reduce(SUM) -- that double-counts Replicate grads
+            # (gives cp1 a 2x norm vs cp2) and makes clipping inconsistent.
+            total_sq = torch.zeros((), device=self.device, dtype=torch.float32)
             for p in params_with_grad:
-                local_sq = local_sq + p.grad.to_local().detach().float().pow(2).sum()
-            global_sq = DistributedInterface().all_reduce(local_sq, op=ReduceOp.SUM, dim=Dim.ALL)
-            grad_norm = float(global_sq.sqrt().item())
+                total_sq = total_sq + p.grad.detach().float().pow(2).sum()
+            if isinstance(total_sq, DTensor):
+                total_sq = total_sq.full_tensor()
+            grad_norm = float(total_sq.sqrt().item())
             clip_coef = max_norm / (grad_norm + 1e-6)
             if clip_coef < 1.0:
                 for p in params_with_grad:
