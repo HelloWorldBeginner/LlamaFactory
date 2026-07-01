@@ -306,7 +306,14 @@ class BaseTrainer:
                         loss = self.compute_loss(micro_batch)
                     raw_loss = loss.item()
                     mini_step_valid_tokens = compute_valid_tokens([micro_batch])
-                    loss = loss * mini_step_valid_tokens * self.dp_size / (step_valid_tokens + 1e-6)
+                    # Scale by world_size (= dp_size * cp_size), not dp_size. FSDP2 mean-reduces
+                    # gradients over the full shard mesh (world_size), and the SP loss is already a
+                    # global full-sequence mean (CP all-gathers log_probs). With *dp_size, CP2's
+                    # loss_scaling = (seq/2)*dp/(dp*seq) = 0.5 (its mini is seq/2 because it holds
+                    # 1/cp of the sequence), so its gradient is half CP1's -> grad_norm 2x off and
+                    # loss diverges. *world_size makes CP2's loss_scaling = (seq/2)*(dp*cp)/(dp*seq)
+                    # = 1, matching CP1. No-op for cp_size=1 (world_size == dp_size).
+                    loss = loss * mini_step_valid_tokens * (self.dp_size * self.cp_size) / (step_valid_tokens + 1e-6)
 
                     if self._deepspeed_engine is not None:
                         # deepspeed: set sync_gradients so engine.step() only fires on last micro-batch
