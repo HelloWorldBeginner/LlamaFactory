@@ -263,8 +263,8 @@ class BaseTrainer:
                         loss = SequenceParallelLossPlugin("sequence_parallel_loss")(self.model, micro_batch)
                     else:
                         loss = self.compute_loss(micro_batch)
+                    raw_loss = loss.item()
                     mini_step_valid_tokens = compute_valid_tokens([micro_batch])
-                    # fsdp uses mean reduction so we need to scale the loss by dp_size
                     loss = loss * mini_step_valid_tokens * self.dp_size / (step_valid_tokens + 1e-6)
 
                     if self._deepspeed_engine is not None:
@@ -273,18 +273,13 @@ class BaseTrainer:
                         self._deepspeed_engine.backward(loss)
                     else:
                         loss.backward()
-                    step_loss += loss.item()
+                    step_loss += raw_loss
 
                 if self._deepspeed_engine is not None:
                     # deepspeed: engine.step() already ran inside backward at the sync boundary
                     grad_norm = self._deepspeed_engine.get_grad_norm()
                 else:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm).item()
-
-                    if self.args.dist_config and self.args.dist_config.get("cp_size", 1) > 1:
-                        grad_norm = grad_norm**2
-                        grad_norm = DistributedInterface().all_reduce(grad_norm, op=ReduceOp.SUM, dim=Dim.CP)
-                        grad_norm = grad_norm**0.5
 
                     if not torch.isfinite(torch.tensor(grad_norm)):  # type: ignore # pyright: ignore [reportUnknownReturnType]
                         logger.warning_rank0(f"Gradient norm is not finite: {grad_norm}")
