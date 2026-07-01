@@ -211,6 +211,41 @@ class BaseTrainer:
                 self.optimizer, self.num_training_steps, self.args.lr_scheduler_config
             )
 
+    def _clip_grad_norm_fsdp2(self, parameters, max_norm: float) -> float:
+        """Global grad-norm clipping that is consistent across world sizes.
+
+        ``torch.nn.utils.clip_grad_norm_`` on FSDP2 DTensor params clips using a
+        per-rank (local-shard) norm, so the clip coefficient differs by world_size
+        (e.g. CP1 vs CP2 get different norms) and the updates diverge. Instead,
+        compute the global L2 norm by summing local squared norms and all-reducing
+        across all ranks, then clip every grad with the same global coefficient.
+        Falls back to ``clip_grad_norm_`` for non-DTensor (e.g. DDP) grads.
+        """
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:  # pragma: no cover
+            DTensor = None  # type: ignore[assignment]
+
+        params_with_grad = [p for p in parameters if p.grad is not None]
+        if not params_with_grad:
+            return 0.0
+
+        if DTensor is not None and isinstance(params_with_grad[0].grad, DTensor):
+            # FSDP2: grads are sharded DTensors. Sum local squared norms, all-reduce to global.
+            local_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            for p in params_with_grad:
+                local_sq = local_sq + p.grad.to_local().detach().float().pow(2).sum()
+            global_sq = DistributedInterface().all_reduce(local_sq, op=ReduceOp.SUM, dim=Dim.ALL)
+            grad_norm = float(global_sq.sqrt().item())
+            clip_coef = max_norm / (grad_norm + 1e-6)
+            if clip_coef < 1.0:
+                for p in params_with_grad:
+                    p.grad.mul_(clip_coef)
+            return grad_norm
+        else:
+            # Non-FSDP2 (DDP / single): grads are replicated, clip_grad_norm_ is correct.
+            return float(torch.nn.utils.clip_grad_norm_(params_with_grad, max_norm).item())
+
     def compute_log_probs(self, model: HFModel, batch: BatchInput) -> Tensor:
         """Compute log probs.
 
@@ -279,7 +314,7 @@ class BaseTrainer:
                     # deepspeed: engine.step() already ran inside backward at the sync boundary
                     grad_norm = self._deepspeed_engine.get_grad_norm()
                 else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm).item()
+                    grad_norm = self._clip_grad_norm_fsdp2(self.model.parameters(), self.args.max_grad_norm)
 
                     if not torch.isfinite(torch.tensor(grad_norm)):  # type: ignore # pyright: ignore [reportUnknownReturnType]
                         logger.warning_rank0(f"Gradient norm is not finite: {grad_norm}")
