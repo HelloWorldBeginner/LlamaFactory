@@ -252,7 +252,7 @@ class BaseTrainer:
 
                 step_loss = 0
                 step_valid_tokens = compute_valid_tokens(micro_batches)
-                step_valid_tokens = DistributedInterface().all_reduce(step_valid_tokens, op=ReduceOp.SUM)
+                step_valid_tokens = DistributedInterface().all_reduce(step_valid_tokens, op=ReduceOp.SUM, dim=Dim.ALL)
                 num_micro = len(micro_batches)
                 for i, micro_batch in enumerate(micro_batches):
                     if self.args.dist_config and self.args.dist_config.get("cp_size", 1) > 1:

@@ -49,6 +49,7 @@ class Dim(StrEnum):
     MP_SHARD = "mp_shard"
     DP = "dp"
     CP = "cp"
+    ALL = "all"
 
 
 @dataclass
@@ -194,7 +195,7 @@ class DistributedInterface:
 
     def get_group(self, dim: Dim | None = None) -> Optional[ProcessGroup]:
         """Get process group for specified dimension."""
-        if not self._is_distributed or dim is None:
+        if not self._is_distributed or dim is None or dim == Dim.ALL:
             return None
         else:
             return self.get_device_mesh(dim).get_group()
