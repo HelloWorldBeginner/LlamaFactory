@@ -198,11 +198,11 @@ def sequence_parallel_loss(model, model_inputs):
     cp_group = get_ulysses_sequence_parallel_group()
 
     # All-reduce loss and token count across CP (two scalars — lightweight vs gathering log_probs).
-    # dist.all_reduce is in-place and not in the autograd graph, but for SUM the backward is
-    # identity (d(sum)/d(local) = 1), so the original cross_entropy grad_fn gives the correct
-    # local gradient d(local_loss)/d(logits) / num_items — no cross-rank grad comm needed.
-    dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=cp_group)
-    dist.all_reduce(num_items, op=dist.ReduceOp.SUM, group=cp_group)
+    # Must use dist.nn.all_reduce (differentiable): backward of SUM is identity, so each rank gets
+    # the correct local gradient d(local_loss)/d(logits) / num_items. dist.all_reduce (in-place)
+    # is NOT in the autograd graph and breaks backward on NPU.
+    loss = dist.nn.all_reduce(loss, op=dist.ReduceOp.SUM, group=cp_group)
+    num_items = dist.nn.all_reduce(num_items, op=dist.ReduceOp.SUM, group=cp_group)
 
     loss = loss / (num_items + 1e-6)  # global per-token mean
 
