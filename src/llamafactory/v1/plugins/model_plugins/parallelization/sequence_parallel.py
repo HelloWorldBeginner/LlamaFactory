@@ -28,8 +28,6 @@ from ....utils.types import ModelOutput
 from .ulysses import (
     UlyssesAttention,
     get_ulysses_sequence_parallel_group,
-    get_ulysses_sequence_parallel_rank,
-    get_ulysses_sequence_parallel_world_size,
     set_ulysses_sequence_parallel_group,
 )
 
@@ -139,9 +137,9 @@ def padding_and_split_data(data, device_mesh=None):
                 dist.all_gather(global_data_len, data_len, group=cp_group)
                 max_data_len = max(global_data_len)
                 pad_size = max_data_len - v.shape[-1] + (cp_size - max_data_len % cp_size) % cp_size
-                if k == "labels":
+                if k in ("labels", "shift_labels"):
                     pad_value = -100
-                elif k == "loss_weights":
+                elif k in ("loss_weights", "shift_loss_weights"):
                     pad_value = 0.0
                 else:
                     pad_value = 0
@@ -155,50 +153,57 @@ def sequence_parallel_loss(model, model_inputs):
     device_mesh = DistributedInterface().get_device_mesh(Dim.CP)
 
     # Move tensors to the current accelerator device (e.g. npu:local_rank).
-    # `dist.get_rank()` returns an int rank; `Tensor.to(int)` is a dtype cast, not a device move.
     current_device = get_current_device()
     model_inputs = {
         k: v.to(current_device, non_blocking=True) for k, v in model_inputs.items() if isinstance(v, torch.Tensor)
     }
 
+    # Shift labels (and loss_weights) BEFORE splitting across CP ranks (MindSpeed style).
+    # Shifting on the full sequence then splitting ensures each CP rank's shift_labels
+    # includes the boundary token from the next rank, so no all-gather of labels/log_probs
+    # is needed — only a scalar all-reduce of the loss sum and token count.
+    labels = model_inputs["labels"]
+    shift_labels = F.pad(labels[..., 1:], (0, 1), value=-100)
+    model_inputs["shift_labels"] = shift_labels
+
+    has_loss_weights = "loss_weights" in model_inputs
+    if has_loss_weights:
+        loss_weights = model_inputs["loss_weights"]
+        shift_loss_weights = F.pad(loss_weights[..., 1:], (0, 1), value=0.0)
+        model_inputs["shift_loss_weights"] = shift_loss_weights
+
     model_inputs = padding_and_split_data(model_inputs, device_mesh)
 
-    batch_size, _ = model_inputs["labels"].shape
+    # Pop shift_* keys — they are for the loss, not model inputs.
+    shift_labels = model_inputs.pop("shift_labels")
+    shift_loss_weights = model_inputs.pop("shift_loss_weights", None)
 
+    # Model forward on the local sequence shard.
     outputs: ModelOutput = model(**model_inputs)
-
     logits = outputs.logits.float()
 
-    labels = model_inputs["labels"]
+    # Local CE SUM (scalar) — MindSpeed style: compute per-token loss locally, sum to a scalar,
+    # then all-reduce the scalar across CP (not gather the full per-token log_probs tensor).
+    shift_logits = logits.view(-1, logits.size(-1))
+    shift_labels_flat = shift_labels.view(-1)
+
+    if shift_loss_weights is not None:
+        per_token = F.cross_entropy(shift_logits, shift_labels_flat, ignore_index=-100, reduction="none")
+        loss = (per_token * shift_loss_weights.view(-1)).sum()
+        num_items = shift_loss_weights.sum()
+    else:
+        loss = F.cross_entropy(shift_logits, shift_labels_flat, ignore_index=-100, reduction="sum")
+        num_items = (shift_labels_flat != -100).sum().to(loss.dtype)
 
     cp_group = get_ulysses_sequence_parallel_group()
-    cp_world_size = get_ulysses_sequence_parallel_world_size(cp_group)
-    cp_rank = get_ulysses_sequence_parallel_rank(cp_group)
 
-    # use all_gather to collect labels from all sequence parallel processes
-    global_labels = [torch.empty_like(labels) for _ in range(cp_world_size)]
-    dist.all_gather(global_labels, labels, group=cp_group)
-    labels = torch.cat(global_labels, dim=1).contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    shift_labels = F.pad(shift_labels, (0, 1), value=-100)
-    shift_labels = torch.chunk(shift_labels, chunks=cp_world_size, dim=1)[cp_rank].contiguous()
+    # All-reduce loss and token count across CP (two scalars — lightweight vs gathering log_probs).
+    # dist.all_reduce is in-place and not in the autograd graph, but for SUM the backward is
+    # identity (d(sum)/d(local) = 1), so the original cross_entropy grad_fn gives the correct
+    # local gradient d(local_loss)/d(logits) / num_items — no cross-rank grad comm needed.
+    dist.all_reduce(loss, op=dist.ReduceOp.SUM, group=cp_group)
+    dist.all_reduce(num_items, op=dist.ReduceOp.SUM, group=cp_group)
 
-    # use all_gather to collect loss_weights from all sequence parallel processes
-    loss_weights = model_inputs["loss_weights"]
-    global_loss_weights = [torch.empty_like(loss_weights) for _ in range(cp_world_size)]
-    dist.all_gather(global_loss_weights, loss_weights, group=cp_group)
-    shift_loss_weights = torch.cat(global_loss_weights, dim=1).contiguous()
-    shift_loss_weights = shift_loss_weights[..., 1:].contiguous()
-
-    shift_logits = logits.view(-1, logits.size(-1)).contiguous()
-    shift_labels = shift_labels.view(-1).contiguous()
-
-    # use all_gather to collect log_probs from all sequence parallel processes
-    log_probs = -F.cross_entropy(shift_logits, shift_labels, reduction="none").view(batch_size, -1)
-    global_log_probs = dist.nn.all_gather(log_probs, group=cp_group)
-    global_log_probs = torch.cat(global_log_probs, dim=1).contiguous()
-    log_probs = global_log_probs[..., :-1].contiguous()
-
-    loss = (-log_probs * shift_loss_weights).sum() / (shift_loss_weights.sum() + 1e-6)
+    loss = loss / (num_items + 1e-6)  # global per-token mean
 
     return loss
