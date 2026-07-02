@@ -62,6 +62,10 @@ def new_flash_attn_forward(
 ):
     if mode == "ulysses":
         dist_attn = UlyssesAttention(sequence_process_group=group, attn_fn=attn_fn)
+        # Pop kwargs that UlyssesAttention handles explicitly, forward the rest
+        # (sliding_window, softcap, etc.) to attn_fn so CP attention matches non-CP.
+        position_ids = kwargs.pop("position_ids", None)
+        softmax_scale = kwargs.pop("softmax_scale", None)
         attn_output = dist_attn(
             query_states,
             key_states,
@@ -71,8 +75,10 @@ def new_flash_attn_forward(
             deterministic=deterministic,
             dropout_p=dropout,
             causal=is_causal,
-            position_ids=kwargs.get("position_ids", None),
+            position_ids=position_ids,
+            softmax_scale=softmax_scale,
             target_dtype=target_dtype,
+            **kwargs,
         )
     else:
         raise NotImplementedError("Other sequence parallel modes are to be implemented.")
