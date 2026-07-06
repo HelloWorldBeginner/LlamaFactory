@@ -11,21 +11,21 @@ init_config:
   name: init_on_meta
 
 # Distribution / Sequence Parallel Config
-# world_size must be divisible by cp_size: dp_size = world_size // cp_size
-# cp_size must divide num_attention_heads (Qwen3-8B has 32 heads / 8 kv heads)
+# CP1 baseline: cp_size=1 (CP off). Keep dp_size identical to the CP2 run so
+# rank0 sees the same data in both runs — required for a valid tensor comparison.
 dist_config:
   name: fsdp2
   dcp_path: null
-  cp_mode: ulysses                      # only ulysses is supported currently
-  cp_size: 2                            # choices: 2 / 4 / 8 / 16 for Qwen3-8B
+  cp_mode: ulysses
+  cp_size: 1                            # CP off (baseline)
 
 ### data
 train_dataset: data/alpaca_en_52k.yaml
 
 ### training
-output_dir: outputs/test_ulysses_cp
+output_dir: outputs/test_ulysses_cp1
 micro_batch_size: 1
-cutoff_len: 4096                        # 8B + 长序列易 OOM，先用 4096 验证通路
+cutoff_len: 4096                        # must be divisible by cp_size in the CP2 run
 learning_rate: 1.0e-4
 bf16: true                              # flash_attention_2 requires half precision
 max_steps: 10

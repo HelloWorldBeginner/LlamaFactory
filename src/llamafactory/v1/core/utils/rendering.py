@@ -147,7 +147,7 @@ class Renderer:
             if "messages" in sample:
                 model_input = self.render_messages(sample["messages"], sample.get("tools"))
                 if "position_ids" not in model_input:
-                    model_input["position_ids"] = list(range(1, len(model_input["input_ids"]) + 1))
+                    model_input["position_ids"] = list(range(len(model_input["input_ids"])))
             elif "chosen_messages" in sample and "rejected_messages" in sample:
                 chosen_input = self.render_messages(sample["chosen_messages"], sample.get("tools"))
                 rejected_input = self.render_messages(sample["rejected_messages"], sample.get("tools"))

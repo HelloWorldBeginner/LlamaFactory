@@ -1,0 +1,4 @@
+alpaca_en_52k:
+  path: alpaca_data_en_52k.json      # 文件在仓库根目录；若移到 data/ 下则改为 data/alpaca_data_en_52k.json
+  source: local
+  converter: alpaca

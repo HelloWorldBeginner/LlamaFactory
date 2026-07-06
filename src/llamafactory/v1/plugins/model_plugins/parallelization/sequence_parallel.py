@@ -58,9 +58,17 @@ def new_flash_attn_forward(
     mode="ulysses",
     attn_fn=None,
     target_dtype=None,
+    num_attention_heads=None,
+    num_key_value_heads=None,
     **kwargs,
 ):
     if mode == "ulysses":
+        if num_attention_heads is not None and num_key_value_heads is not None:
+            num_groups = num_attention_heads // num_key_value_heads
+            if num_groups > 1:
+                key_states = torch.repeat_interleave(key_states, dim=2, repeats=num_groups)
+                value_states = torch.repeat_interleave(value_states, dim=2, repeats=num_groups)
+
         dist_attn = UlyssesAttention(sequence_process_group=group, attn_fn=attn_fn)
         # Pop kwargs that UlyssesAttention handles explicitly, forward the rest
         # (sliding_window, softcap, etc.) to attn_fn so CP attention matches non-CP.
@@ -114,6 +122,8 @@ def apply_sequence_parallel(model, model_args):
         mode="ulysses",
         attn_fn=origin_attn,
         sequence_parallel_size=cp_size,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
     )
 
     for module_name, module in list(sys.modules.items()):
@@ -142,14 +152,26 @@ def padding_and_split_data(data, device_mesh=None):
                 global_data_len = [torch.empty_like(data_len) for _ in range(cp_size)]
                 dist.all_gather(global_data_len, data_len, group=cp_group)
                 max_data_len = max(global_data_len)
-                pad_size = max_data_len - v.shape[-1] + (cp_size - max_data_len % cp_size) % cp_size
+                real_pad = max_data_len - v.shape[-1]
+                round_pad = (cp_size - max_data_len % cp_size) % cp_size
+
                 if k in ("labels", "shift_labels"):
-                    pad_value = -100
+                    pad_data = F.pad(v, (0, real_pad + round_pad), value=-100)
                 elif k in ("loss_weights", "shift_loss_weights"):
-                    pad_value = 0.0
+                    pad_data = F.pad(v, (0, real_pad + round_pad), value=0.0)
+                elif k == "attention_mask":
+                    pad_data = F.pad(v, (0, real_pad), value=0)
+                    if round_pad > 0:
+                        pad_data = F.pad(pad_data, (0, round_pad), value=1)
+                elif k == "position_ids":
+                    pad_data = F.pad(v, (0, real_pad), value=0)
+                    if round_pad > 0:
+                        last_pos = pad_data[..., -1:]
+                        round_pos = last_pos + torch.arange(1, round_pad + 1, device=v.device, dtype=v.dtype)
+                        pad_data = torch.cat([pad_data, round_pos], dim=-1)
                 else:
-                    pad_value = 0
-                pad_data = F.pad(v, (0, pad_size), value=pad_value)
+                    pad_data = F.pad(v, (0, real_pad + round_pad), value=0)
+
                 data[k] = torch.chunk(pad_data, chunks=cp_size, dim=-1)[cp_rank].contiguous()
     return data
 
