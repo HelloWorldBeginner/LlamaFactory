@@ -153,6 +153,11 @@ class BaseTrainer:
 
             SequenceParallelModelPlugin(self.args.dist_config.get("cp_mode", "ulysses"))(model, self.args.dist_config)
 
+        # CP precision debug (cp-precision-debug skill). Env-gated: no-op unless CP_DEBUG=1.
+        # Registered after model sharding and the CP plugin so the CP group is available
+        # and hooks sit on the wrapped model. Weights are lazily recorded on first forward.
+        self.cp_debug_manager = self._register_cp_debug_hooks(model)
+
     def _create_batch_generator(self) -> None:
         if (
             self.args.batching_strategy == BatchingStrategy.PADDING_FREE
@@ -273,6 +278,48 @@ class BaseTrainer:
         """Compute the scalar loss."""
         ...
 
+    def _register_cp_debug_hooks(self, model: HFModel):
+        """Register CP precision-debug hooks (no-op unless CP_DEBUG=1).
+
+        Compares CP1 (cp_size=1) vs CP2 (cp_size>1) per-layer tensors. The CP
+        group comes from the distributed interface; expected_seq_len defaults to
+        cutoff_len (override via CP_DEBUG_SEQ_LEN). When enabled, micro-batches
+        are padded to cutoff_len so CP1/CP2 sequence shapes align for all-gather.
+        See ``cp_debug/`` and the skill references for the full workflow.
+        """
+        import os
+
+        if os.environ.get("CP_DEBUG", "0") != "1":
+            from .cp_debug import NoOpCPDebugManager
+
+            return NoOpCPDebugManager()
+
+        from .cp_debug import CPDebugConfig, register_cp_debug_hooks
+
+        # CP1 (cp_size=1) may not have a CP dim in the device mesh; fall back to
+        # None — all_gather then no-ops and the local (full-seq) tensor is recorded.
+        try:
+            cp_group = DistributedInterface().get_group(Dim.CP)
+        except (KeyError, ValueError):
+            cp_group = None
+        expected_seq_len = int(os.environ.get("CP_DEBUG_SEQ_LEN", str(self.args.cutoff_len)))
+        config = CPDebugConfig(
+            enabled=True,
+            mode="dump",
+            record="both",
+            cp_group=cp_group,
+            expected_seq_len=expected_seq_len,
+            max_steps=int(os.environ.get("CP_DEBUG_MAX_STEPS", "1")),
+            dump_dir=os.environ.get("CP_DEBUG_DUMP_DIR", "./cp_debug_dumps"),
+            module_filter=os.environ.get("CP_DEBUG_MODULE_FILTER"),
+        )
+        manager = register_cp_debug_hooks(model, config)
+        logger.info_rank0(
+            f"[CP_DEBUG] hooks registered: cp_group={'set' if cp_group is not None else 'None'}, "
+            f"expected_seq_len={expected_seq_len}, max_steps={config.max_steps}"
+        )
+        return manager
+
     def fit(self) -> None:
         """Train the model."""
         self.model.train()
@@ -318,9 +365,15 @@ class BaseTrainer:
                     if self._deepspeed_engine is not None:
                         # deepspeed: set sync_gradients so engine.step() only fires on last micro-batch
                         self._deepspeed_engine.accelerator.sync_gradients = i == num_micro - 1
+                        self.cp_debug_manager.set_in_backward(True)
                         self._deepspeed_engine.backward(loss)
+                        self.cp_debug_manager.set_in_backward(False)
                     else:
+                        self.cp_debug_manager.set_in_backward(True)
                         loss.backward()
+                        self.cp_debug_manager.set_in_backward(False)
+                    # Read param.grad after backward (NPU-safe; no full_backward_hook).
+                    self.cp_debug_manager.collect_param_gradients()
                     step_loss += raw_loss
 
                 if self._deepspeed_engine is not None:

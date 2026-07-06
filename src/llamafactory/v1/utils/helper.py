@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import os
 import random
 
 import numpy as np
@@ -91,6 +92,11 @@ def _pad_and_truncate(tensor: Tensor, max_seqlen: int, pad_value: int = 0) -> Te
 
 def pad_and_truncate(samples: list[ModelInput], max_seqlen: int) -> list[BatchInput]:
     max_length = min(max(len(sample["input_ids"]) for sample in samples), max_seqlen)
+    # CP precision debug: force uniform sequence length so CP1 (full seq) and CP2
+    # (all-gathered seq) shapes align for tensor comparison. Pads every sample to
+    # max_seqlen (== cutoff_len); requires cutoff_len % cp_size == 0 for even CP split.
+    if os.environ.get("CP_DEBUG_PAD_TO_CUTOFF", "1" if os.environ.get("CP_DEBUG", "0") == "1" else "0") == "1":
+        max_length = max_seqlen
     padded_samples = []
     for sample in samples:
         padded_sample = {}
