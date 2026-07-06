@@ -74,6 +74,7 @@ def new_flash_attn_forward(
         # (sliding_window, softcap, etc.) to attn_fn so CP attention matches non-CP.
         position_ids = kwargs.pop("position_ids", None)
         softmax_scale = kwargs.pop("softmax_scale", None)
+        kwargs.pop("query_length", None)  # HF passes local length; we use global length below
         attn_output = dist_attn(
             query_states,
             key_states,
