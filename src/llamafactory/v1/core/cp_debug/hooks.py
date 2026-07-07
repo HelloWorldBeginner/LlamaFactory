@@ -534,6 +534,19 @@ def register_cp_debug_hooks(
               f"(no backward hooks, use collect_param_gradients after backward)")
         if config.module_filter:
             print(f"[CP_DEBUG] Module filter: {config.module_filter}")
+        # 校验 CP_DEBUG_RANK 取值范围（dp_rank，非全局 rank）
+        if config.debug_ranks is not None:
+            cp_world = dist.get_world_size(config.cp_group) if config.cp_group else 1
+            dp_world = dist.get_world_size() // cp_world
+            invalid = [r for r in config.debug_ranks if r < 0 or r >= dp_world]
+            if invalid:
+                print(
+                    f"[CP_DEBUG] WARNING: CP_DEBUG_RANK {invalid} out of range "
+                    f"(valid dp_rank: 0..{dp_world - 1}; dp_size={dp_world}). "
+                    f"These dp_ranks will be silently skipped. "
+                    f"CP_DEBUG_RANK takes DP_RANK values, not global ranks.",
+                    flush=True,
+                )
 
     return manager
 
