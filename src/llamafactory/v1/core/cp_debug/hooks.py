@@ -197,13 +197,68 @@ class CPDebugManager:
             self._record_all_weights(module)
             self._weights_recorded = True
 
-        # 捕获 forward kwargs（HF 当 kwargs 传，位置 hook 抓不到）
+        # 捕获 forward kwargs（HF 当 kwargs 传，位置 hook 抓不到；None 安全）
         if kwargs and self.should_record():
             step = self.get_step()
             for key in ("input_ids", "attention_mask", "position_ids"):
-                val = kwargs.get(key)
-                if isinstance(val, torch.Tensor):
-                    self.record(f"model.{key}", val, step, hook_type="fwd_in")
+                self._record_root_kwarg(key, kwargs.get(key), step)
+
+    def _comm_device(self):
+        """all-gather 用的设备：优先模型参数所在设备，回退 CPU。"""
+        if self._model_ref is not None:
+            try:
+                return next(self._model_ref.parameters()).device
+            except (StopIteration, RuntimeError):
+                pass
+        return torch.device("cpu")
+
+    def _record_root_kwarg(self, key: str, val, step: int) -> None:
+        """记录 root forward kwarg，None 安全。
+
+        attention_mask / position_ids 可能为 None（全 1 被 HF 折叠、无 padding 路径）。
+        若 CP 组内某些 rank 是 None、某些是 tensor，朴素 all-gather 会死锁（有人等没人）。
+        先跨 CP 同步 None 性：
+        - 全 None → 写哨兵 tensor([0])，rank0 落盘，compare 看到两端一致（shape [1], 0）。
+        - 全 tensor → 正常 record()（内含 all-gather，CP2 分片拼回全长）。
+        - 混合 → 跳过 + 告警，避免死锁。
+        """
+        is_tensor = isinstance(val, torch.Tensor)
+        cp_group = self.get_cp_group()
+        if cp_group is not None and dist.is_initialized():
+            sp = dist.get_world_size(cp_group)
+            device = val.device if is_tensor else self._comm_device()
+            flag = torch.tensor([1 if is_tensor else 0], dtype=torch.int64, device=device)
+            gathered = [torch.empty_like(flag) for _ in range(sp)]
+            dist.all_gather(gathered, flag, group=cp_group)
+            n_tensor = sum(int(x.item()) for x in gathered)
+        else:
+            sp = 1
+            n_tensor = 1 if is_tensor else 0
+
+        all_none = (n_tensor == 0)
+        all_tensor = (n_tensor == sp)
+
+        if all_none:
+            # 两端都 None：写哨兵，让 compare 能确认一致（不走 all-gather）
+            if dist.is_initialized() and dist.get_rank() != 0:
+                return
+            dump_path = Path(self.config.dump_dir) / f"step{step}"
+            dump_path.mkdir(parents=True, exist_ok=True)
+            torch.save(torch.tensor([0]), dump_path / f"model.{key}.pt")
+            return
+
+        if not all_tensor:
+            # 混合 None/tensor → 跳过避免死锁
+            if dist.is_initialized() and dist.get_rank() == 0:
+                print(
+                    f"[CP_DEBUG] root kwarg '{key}' mixed None/tensor across CP ranks; "
+                    f"skipping to avoid all-gather deadlock",
+                    flush=True,
+                )
+            return
+
+        # 全 tensor → 正常记录（record 内 all-gather）
+        self.record(f"model.{key}", val, step, hook_type="fwd_in")
 
     def should_record(self) -> bool:
         """是否应该记录当前 step"""
