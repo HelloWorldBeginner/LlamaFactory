@@ -116,8 +116,9 @@ def tensor_stats(tensor: torch.Tensor) -> Dict[str, Any]:
         t = tensor.detach().float()
         flat = t.flatten()
         abs_t = t.abs()
-        absmax_flat = int(abs_t.argmax().item())
-        absmax_loc = tuple(int(i) for i in torch.unravel_index(absmax_flat, t.shape))
+        # unravel_index 在部分 torch 版本要求 indices 为 tensor（不接受 int）
+        absmax_idx = abs_t.argmax()
+        absmax_loc = tuple(int(i) for i in torch.unravel_index(absmax_idx, t.shape))
         return {
             "shape": list(tensor.shape),
             "mean": t.mean().item(),

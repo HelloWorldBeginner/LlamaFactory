@@ -127,7 +127,8 @@ def compare_tensors(
     mean_diff = diff.mean().item()
 
     # 逐元素相减后绝对值最大的位置 + 该位置两端的值
-    flat_idx = int(diff.argmax().item())
+    # unravel_index 在部分 torch 版本要求 indices 为 tensor（不接受 int）
+    flat_idx = diff.argmax()
     max_loc = tuple(int(i) for i in torch.unravel_index(flat_idx, diff.shape))
     val1 = t1f[max_loc].item()
     val2 = t2f[max_loc].item()
