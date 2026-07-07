@@ -79,9 +79,20 @@ class CPDebugConfig:
             self.record = env["CP_DEBUG_RECORD"]
         if "CP_DEBUG_PRINT_FILE" in env:
             self.print_file = env["CP_DEBUG_PRINT_FILE"]
-        # print/both 模式下，若未显式指定 print_file，默认落到 {dump_dir}/print.log
+        # print/both 模式下，若未显式指定 print_file，默认落到
+        # {dump_dir}/cp{cp_size}_{时间戳}.log（cp_size 取自 cp_group，CP1 为 1；
+        # 时间戳在 config 初始化时取一次，整个 run 写同一文件；目录由 _print 自动创建）
         if self.print_file is None and self.mode in ("print", "both"):
-            self.print_file = str(Path(self.dump_dir) / "print.log")
+            try:
+                if self.cp_group is not None and dist.is_initialized():
+                    cp_size = dist.get_world_size(self.cp_group)
+                else:
+                    cp_size = 1
+            except Exception:
+                cp_size = 1
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.print_file = str(Path(self.dump_dir) / f"cp{cp_size}_{ts}.log")
 
         # 校验枚举字段
         if self.mode not in ("print", "dump", "both"):
