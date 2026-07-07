@@ -57,8 +57,8 @@ class CPDebugConfig:
     module_filter: Optional[str] = None
 
     # 写盘 rank 过滤：None=所有 dp_rank 都写（每个 CP 组由 cp_rank 0 落盘一份）；
-    # 设为列表则只写指定 dp_rank，如 [0,1]。env CP_DEBUG_RANK 逗号分隔。
-    debug_ranks: Optional[List[int]] = None
+    # 设为列表则只写指定 dp_rank，如 [0,1]。env CP_DEBUG_DP_RANK 逗号分隔。
+    debug_dp_ranks: Optional[List[int]] = None
 
     # Step 控制
     auto_step: bool = True
@@ -81,9 +81,9 @@ class CPDebugConfig:
             self.expected_seq_len = int(env["CP_DEBUG_SEQ_LEN"])
         if "CP_DEBUG_MODULE_FILTER" in env:
             self.module_filter = env["CP_DEBUG_MODULE_FILTER"]
-        if "CP_DEBUG_RANK" in env:
-            raw = env["CP_DEBUG_RANK"].strip()
-            self.debug_ranks = [int(x) for x in raw.split(",") if x.strip() != ""] if raw else None
+        if "CP_DEBUG_DP_RANK" in env:
+            raw = env["CP_DEBUG_DP_RANK"].strip()
+            self.debug_dp_ranks = [int(x) for x in raw.split(",") if x.strip() != ""] if raw else None
         if "CP_DEBUG_STEPS" in env:
             raw = env["CP_DEBUG_STEPS"].strip()
             if raw and "-" in raw and "," not in raw:
@@ -248,12 +248,12 @@ class CPDebugManager:
         return 0
 
     def _should_write(self) -> bool:
-        """每个 CP 组由 cp_rank 0 落盘一份（按 dp_rank 分目录）；debug_ranks 过滤 dp_rank。"""
+        """每个 CP 组由 cp_rank 0 落盘一份（按 dp_rank 分目录）；debug_dp_ranks 过滤 dp_rank。"""
         if self._cp_rank() != 0:
             return False
-        if self.config.debug_ranks is None:
+        if self.config.debug_dp_ranks is None:
             return True
-        return self._dp_rank() in self.config.debug_ranks
+        return self._dp_rank() in self.config.debug_dp_ranks
 
     def _dump_dir(self, step: int) -> Path:
         """按 dp_rank 分目录：{dump_dir}/dp_rank{D}/step{S}/"""
@@ -534,17 +534,17 @@ def register_cp_debug_hooks(
               f"(no backward hooks, use collect_param_gradients after backward)")
         if config.module_filter:
             print(f"[CP_DEBUG] Module filter: {config.module_filter}")
-        # 校验 CP_DEBUG_RANK 取值范围（dp_rank，非全局 rank）
-        if config.debug_ranks is not None:
+        # 校验 CP_DEBUG_DP_RANK 取值范围（dp_rank，非全局 rank）
+        if config.debug_dp_ranks is not None:
             cp_world = dist.get_world_size(config.cp_group) if config.cp_group else 1
             dp_world = dist.get_world_size() // cp_world
-            invalid = [r for r in config.debug_ranks if r < 0 or r >= dp_world]
+            invalid = [r for r in config.debug_dp_ranks if r < 0 or r >= dp_world]
             if invalid:
                 print(
-                    f"[CP_DEBUG] WARNING: CP_DEBUG_RANK {invalid} out of range "
+                    f"[CP_DEBUG] WARNING: CP_DEBUG_DP_RANK {invalid} out of range "
                     f"(valid dp_rank: 0..{dp_world - 1}; dp_size={dp_world}). "
                     f"These dp_ranks will be silently skipped. "
-                    f"CP_DEBUG_RANK takes DP_RANK values, not global ranks.",
+                    f"CP_DEBUG_DP_RANK takes DP_RANK values, not global ranks.",
                     flush=True,
                 )
 
