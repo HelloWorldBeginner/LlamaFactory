@@ -31,6 +31,8 @@ class CPDebugConfig:
     # CP 相关
     cp_group: Any = None
     cp_group_name: str = "cp"
+    # DP 相关（用于多 rank dump 按 dp_rank 分目录；不传则按 global_rank//cp_size 推断）
+    dp_group: Any = None
 
     # 序列维度
     expected_seq_len: int = None
@@ -54,9 +56,9 @@ class CPDebugConfig:
     # 过滤
     module_filter: Optional[str] = None
 
-    # 写盘 rank：只有该 rank 落盘（其余 rank 仍参与 all-gather）。默认 0。
-    # 两边各自设以对齐同一样本：如 CP1 设 1（dp_rank 1）、CP2 设 2（dp_rank 1 的 cp_rank 0）。
-    debug_rank: int = 0
+    # 写盘 rank 过滤：None=所有 dp_rank 都写（每个 CP 组由 cp_rank 0 落盘一份）；
+    # 设为列表则只写指定 dp_rank，如 [0,1]。env CP_DEBUG_RANK 逗号分隔。
+    debug_ranks: Optional[List[int]] = None
 
     # Step 控制
     auto_step: bool = True
@@ -80,7 +82,16 @@ class CPDebugConfig:
         if "CP_DEBUG_MODULE_FILTER" in env:
             self.module_filter = env["CP_DEBUG_MODULE_FILTER"]
         if "CP_DEBUG_RANK" in env:
-            self.debug_rank = int(env["CP_DEBUG_RANK"])
+            raw = env["CP_DEBUG_RANK"].strip()
+            self.debug_ranks = [int(x) for x in raw.split(",") if x.strip() != ""] if raw else None
+        if "CP_DEBUG_STEPS" in env:
+            raw = env["CP_DEBUG_STEPS"].strip()
+            if raw and "-" in raw and "," not in raw:
+                # "10-15" → 半开区间 [10,16)，记录 step 10..15
+                a, b = raw.split("-", 1)
+                self.step_range = (int(a), int(b) + 1)
+            elif raw:
+                self.step_range = [int(x) for x in raw.split(",") if x.strip() != ""]
         if "CP_DEBUG_RECORD" in env:
             self.record = env["CP_DEBUG_RECORD"]
         if "CP_DEBUG_PRINT_FILE" in env:
@@ -218,6 +229,36 @@ class CPDebugManager:
                 pass
         return torch.device("cpu")
 
+    def _cp_rank(self) -> int:
+        if self.config.cp_group is not None and dist.is_initialized():
+            return dist.get_rank(self.config.cp_group)
+        return 0
+
+    def _cp_world(self) -> int:
+        if self.config.cp_group is not None and dist.is_initialized():
+            return dist.get_world_size(self.config.cp_group)
+        return 1
+
+    def _dp_rank(self) -> int:
+        if self.config.dp_group is not None and dist.is_initialized():
+            return dist.get_rank(self.config.dp_group)
+        if dist.is_initialized():
+            # 回退：假设 dp-outer mesh，global = dp*cp + cp
+            return dist.get_rank() // max(self._cp_world(), 1)
+        return 0
+
+    def _should_write(self) -> bool:
+        """每个 CP 组由 cp_rank 0 落盘一份（按 dp_rank 分目录）；debug_ranks 过滤 dp_rank。"""
+        if self._cp_rank() != 0:
+            return False
+        if self.config.debug_ranks is None:
+            return True
+        return self._dp_rank() in self.config.debug_ranks
+
+    def _dump_dir(self, step: int) -> Path:
+        """按 dp_rank 分目录：{dump_dir}/dp_rank{D}/step{S}/"""
+        return Path(self.config.dump_dir) / f"dp_rank{self._dp_rank()}" / f"step{step}"
+
     def _record_root_kwarg(self, key: str, val, step: int) -> None:
         """记录 root forward kwarg，None 安全。
 
@@ -246,16 +287,16 @@ class CPDebugManager:
 
         if all_none:
             # 两端都 None：写哨兵，让 compare 能确认一致（不走 all-gather）
-            if dist.is_initialized() and dist.get_rank() != self.config.debug_rank:
+            if not self._should_write():
                 return
-            dump_path = Path(self.config.dump_dir) / f"step{step}"
+            dump_path = self._dump_dir(step)
             dump_path.mkdir(parents=True, exist_ok=True)
             torch.save(torch.tensor([0]), dump_path / f"model.{key}.pt")
             return
 
         if not all_tensor:
             # 混合 None/tensor → 跳过避免死锁
-            if dist.is_initialized() and dist.get_rank() == self.config.debug_rank:
+            if self._should_write():
                 print(
                     f"[CP_DEBUG] root kwarg '{key}' mixed None/tensor across CP ranks; "
                     f"skipping to avoid all-gather deadlock",
@@ -315,8 +356,8 @@ class CPDebugManager:
                     self.config.default_seq_gather_dim
                 )
 
-            # all-gather 是集合通信，所有 rank 都必须参与；写盘只在 debug_rank
-            if dist.is_initialized() and dist.get_rank() != self.config.debug_rank:
+            # all-gather 是集合通信，所有 rank 都必须参与；写盘只在 cp_rank 0（每 CP 组一份）
+            if not self._should_write():
                 return
 
             idx = self._step_record_count.get(step, 0)
@@ -343,7 +384,7 @@ class CPDebugManager:
                     self._print(f"[STEP {step}] {name} tensor:\n{gathered.cpu()}")
 
             if effective_mode in ("dump", "both"):
-                dump_path = Path(self.config.dump_dir) / f"step{step}"
+                dump_path = self._dump_dir(step)
                 dump_path.mkdir(parents=True, exist_ok=True)
                 torch.save(gathered.cpu(), dump_path / f"{name}.pt")
                 # 增量追加执行顺序，避免每条记录重写整文件（O(n²) → O(n)）
@@ -351,7 +392,7 @@ class CPDebugManager:
 
     def _append_execution_order(self, step: int, idx: int, hook_type: str, name: str, shape):
         """增量追加一条执行顺序记录到 step 目录"""
-        dump_path = Path(self.config.dump_dir) / f"step{step}"
+        dump_path = self._dump_dir(step)
         dump_path.mkdir(parents=True, exist_ok=True)
         order_file = dump_path / "execution_order.txt"
 

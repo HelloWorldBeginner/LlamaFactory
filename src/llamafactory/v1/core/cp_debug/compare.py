@@ -21,23 +21,44 @@ from typing import List, Tuple, Dict, Optional
 import torch
 
 
-def load_tensors(dump_dir: Path, step: int) -> Dict[str, torch.Tensor]:
+def _step_dir(dump_dir: Path, step: int, dp_rank: Optional[int] = None) -> Path:
+    """定位 step 目录：多 rank 布局 {dump_dir}/dp_rank{D}/step{S}/，旧布局 {dump_dir}/step{S}/"""
+    if dp_rank is None:
+        return dump_dir / f"step{step}"
+    return dump_dir / f"dp_rank{dp_rank}" / f"step{step}"
+
+
+def discover_dp_ranks(dump_dir: Path) -> List[int]:
+    """发现 dump 目录下所有 dp_rank 子目录（多 rank 布局）。旧布局返回 []。"""
+    if not dump_dir.exists():
+        return []
+    ranks = []
+    for p in dump_dir.iterdir():
+        if p.is_dir() and p.name.startswith("dp_rank"):
+            try:
+                ranks.append(int(p.name.replace("dp_rank", "")))
+            except ValueError:
+                continue
+    return sorted(ranks)
+
+
+def load_tensors(dump_dir: Path, step: int, dp_rank: Optional[int] = None) -> Dict[str, torch.Tensor]:
     """加载 step 目录下的所有 tensor"""
-    step_dir = dump_dir / f"step{step}"
+    step_dir = _step_dir(dump_dir, step, dp_rank)
     if not step_dir.exists():
         return {}
-    
+
     tensors = {}
     for pt_file in step_dir.glob("*.pt"):
         name = pt_file.stem
         tensors[name] = torch.load(pt_file, map_location="cpu")
-    
+
     return tensors
 
 
-def load_execution_order(dump_dir: Path, step: int) -> List[Dict[str, str]]:
+def load_execution_order(dump_dir: Path, step: int, dp_rank: Optional[int] = None) -> List[Dict[str, str]]:
     """加载执行顺序文件"""
-    order_file = dump_dir / f"step{step}" / "execution_order.txt"
+    order_file = _step_dir(dump_dir, step, dp_rank) / "execution_order.txt"
     if not order_file.exists():
         return []
     
@@ -258,6 +279,58 @@ def print_summary(all_results: Dict[str, List[Tuple[str, str, float, float]]]):
         print(summary)
 
 
+def run_comparison(dir1: Path, dir2: Path, step: int, args, dp_rank: Optional[int]) -> bool:
+    """对单个 dp_rank（或旧布局 dp_rank=None）跑一次完整对比。返回是否有数据。"""
+    tensors1 = load_tensors(dir1, step, dp_rank)
+    tensors2 = load_tensors(dir2, step, dp_rank)
+
+    where = f"dp_rank{dp_rank}/" if dp_rank is not None else ""
+    if not tensors1 and not tensors2:
+        return False
+    if not tensors1:
+        print(f"Error: No tensors in {dir1}/{where}step{step}")
+        return False
+    if not tensors2:
+        print(f"Error: No tensors in {dir2}/{where}step{step}")
+        return False
+
+    header = f"=== CP Debug Comparison: step {step}"
+    if dp_rank is not None:
+        header += f" | dp_rank {dp_rank}"
+    header += " ==="
+    print("\n" + "=" * 90)
+    print(header)
+    print(f"CP1: {dir1}/{where}step{step} ({len(tensors1)} tensors)")
+    print(f"CP2: {dir2}/{where}step{step} ({len(tensors2)} tensors)")
+
+    order1 = load_execution_order(dir1, step, dp_rank)
+    order2 = load_execution_order(dir2, step, dp_rank)
+    if order1 or order2:
+        compare_execution_order(order1, order2)
+
+    categories1 = categorize_tensors(tensors1)
+    categories2 = categorize_tensors(tensors2)
+
+    all_results = {}
+    for category in ["Forward", "Backward", "Weights"]:
+        if category == "Backward" and not args.gradients:
+            continue
+        results = compare_category(
+            category,
+            categories1[category],
+            categories2[category],
+            args.threshold,
+            args.diff_only,
+            args.detail,
+        )
+        if results:
+            all_results[category] = results
+            print_results(category, results)
+
+    print_summary(all_results)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="CP Debug 对比工具")
     parser.add_argument("dir1", type=Path, help="CP1 dump 目录")
@@ -267,65 +340,43 @@ def main():
     parser.add_argument("--diff-only", action="store_true", help="只显示不一致的模块")
     parser.add_argument("--gradients", action="store_true", help="包含梯度对比")
     parser.add_argument("--detail", action="store_true", help="显示完整 tensor diff")
-    
+
     args = parser.parse_args()
-    
-    # 检查目录
+
     if not args.dir1.exists():
         print(f"Error: {args.dir1} does not exist")
         sys.exit(1)
     if not args.dir2.exists():
         print(f"Error: {args.dir2} does not exist")
         sys.exit(1)
-    
-    # 加载 tensor
-    tensors1 = load_tensors(args.dir1, args.step)
-    tensors2 = load_tensors(args.dir2, args.step)
-    
-    if not tensors1:
-        print(f"Error: No tensors found in {args.dir1}/step{args.step}")
+
+    # 多 rank 布局：两边都有 dp_rank*/ 子目录 → 逐个比较，各自输出
+    ranks1 = discover_dp_ranks(args.dir1)
+    ranks2 = discover_dp_ranks(args.dir2)
+    if ranks1 and ranks2:
+        common = sorted(set(ranks1) & set(ranks2))
+        only1 = sorted(set(ranks1) - set(ranks2))
+        only2 = sorted(set(ranks2) - set(ranks1))
+        print(f"CP1 dp_ranks: {ranks1}  CP2 dp_ranks: {ranks2}  common: {common}")
+        if only1:
+            print(f"  only in CP1: {only1}")
+        if only2:
+            print(f"  only in CP2: {only2}")
+        if not common:
+            print("Error: no common dp_rank to compare")
+            sys.exit(1)
+        for r in common:
+            run_comparison(args.dir1, args.dir2, args.step, args, dp_rank=r)
+        return
+
+    # 旧布局（单 rank，step{S}/ 在根）：直接比；若一边多 rank 一边旧布局，提示
+    if ranks1 and not ranks2:
+        print(f"Error: {args.dir1} is multi-rank layout (dp_rank*/), but {args.dir2} is flat. 重新用同版本 dump。")
         sys.exit(1)
-    if not tensors2:
-        print(f"Error: No tensors found in {args.dir2}/step{args.step}")
+    if ranks2 and not ranks1:
+        print(f"Error: {args.dir2} is multi-rank layout (dp_rank*/), but {args.dir1} is flat. 重新用同版本 dump。")
         sys.exit(1)
-    
-    print(f"=== CP Debug Comparison: step {args.step} ===")
-    print(f"CP1: {args.dir1} ({len(tensors1)} tensors)")
-    print(f"CP2: {args.dir2} ({len(tensors2)} tensors)")
-    
-    # 对比执行顺序
-    order1 = load_execution_order(args.dir1, args.step)
-    order2 = load_execution_order(args.dir2, args.step)
-    if order1 or order2:
-        compare_execution_order(order1, order2)
-    
-    # 分类
-    categories1 = categorize_tensors(tensors1)
-    categories2 = categorize_tensors(tensors2)
-    
-    # 对比
-    all_results = {}
-    
-    for category in ["Forward", "Backward", "Weights"]:
-        # 跳过梯度（如果不需要）
-        if category == "Backward" and not args.gradients:
-            continue
-        
-        results = compare_category(
-            category,
-            categories1[category],
-            categories2[category],
-            args.threshold,
-            args.diff_only,
-            args.detail
-        )
-        
-        if results:
-            all_results[category] = results
-            print_results(category, results)
-    
-    # 汇总
-    print_summary(all_results)
+    run_comparison(args.dir1, args.dir2, args.step, args, dp_rank=None)
 
 
 if __name__ == "__main__":

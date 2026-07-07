@@ -302,12 +302,17 @@ class BaseTrainer:
             cp_group = DistributedInterface().get_group(Dim.CP)
         except (KeyError, ValueError):
             cp_group = None
+        try:
+            dp_group = DistributedInterface().get_group(Dim.DP)
+        except (KeyError, ValueError):
+            dp_group = None
         expected_seq_len = int(os.environ.get("CP_DEBUG_SEQ_LEN", str(self.args.cutoff_len)))
         config = CPDebugConfig(
             enabled=True,
             mode="dump",
             record="both",
             cp_group=cp_group,
+            dp_group=dp_group,
             expected_seq_len=expected_seq_len,
             max_steps=int(os.environ.get("CP_DEBUG_MAX_STEPS", "1")),
             dump_dir=os.environ.get("CP_DEBUG_DUMP_DIR", "./cp_debug_dumps"),
