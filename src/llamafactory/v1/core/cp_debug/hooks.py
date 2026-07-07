@@ -175,11 +175,15 @@ class CPDebugManager:
             return self._manual_step
         return self._auto_step
 
-    def _root_pre_hook(self, module: nn.Module, inputs):
-        """Root model pre-hook：自动递增 + 延迟记录权重
+    def _root_pre_hook(self, module: nn.Module, inputs, kwargs: Optional[dict] = None):
+        """Root model pre-hook：自动递增 + 延迟记录权重 + 捕获 forward kwargs
 
         自动 step 模式下，首次 forward 保持 step=0（与 backward 阶段的梯度收集
         对齐到同一 step），从第二次 forward 起在进入前递增。
+
+        额外捕获 forward kwargs（input_ids / attention_mask / position_ids）——
+        HF 把这些当 kwargs 传，位置参数 hook 抓不到，不捕获就无法对比这俩 CP
+        关键输入。需配合注册处 `with_kwargs=True`。
         """
         if self._in_backward:
             return
@@ -192,6 +196,14 @@ class CPDebugManager:
             self._model_ref = module
             self._record_all_weights(module)
             self._weights_recorded = True
+
+        # 捕获 forward kwargs（HF 当 kwargs 传，位置 hook 抓不到）
+        if kwargs and self.should_record():
+            step = self.get_step()
+            for key in ("input_ids", "attention_mask", "position_ids"):
+                val = kwargs.get(key)
+                if isinstance(val, torch.Tensor):
+                    self.record(f"model.{key}", val, step, hook_type="fwd_in")
 
     def should_record(self) -> bool:
         """是否应该记录当前 step"""
@@ -399,7 +411,7 @@ def register_cp_debug_hooks(
     manager = CPDebugManager(config)
     manager._model_ref = model
 
-    handle = model.register_forward_pre_hook(manager._root_pre_hook)
+    handle = model.register_forward_pre_hook(manager._root_pre_hook, with_kwargs=True)
     manager._handles.append(handle)
 
     module_filter_re = None
