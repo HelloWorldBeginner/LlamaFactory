@@ -115,18 +115,12 @@ def tensor_stats(tensor: torch.Tensor) -> Dict[str, Any]:
     with torch.no_grad():
         t = tensor.detach().float()
         flat = t.flatten()
-        abs_t = t.abs()
-        # unravel_index 在部分 torch 版本要求 indices 为 tensor（不接受 int）
-        absmax_idx = abs_t.argmax()
-        absmax_loc = tuple(int(i) for i in torch.unravel_index(absmax_idx, t.shape))
         return {
             "shape": list(tensor.shape),
             "mean": t.mean().item(),
             "std": t.std().item() if flat.numel() > 1 else 0.0,
             "min": t.min().item(),
             "max": t.max().item(),
-            "absmax": abs_t.max().item(),
-            "absmax_loc": absmax_loc,
             "first5": flat[:5].tolist(),
             "last5": flat[-5:].tolist(),
         }
@@ -151,7 +145,6 @@ def format_stats(name: str, stats: Dict[str, Any], step: int) -> str:
         f"std={stats['std']:.6f} "
         f"min={stats['min']:.6f} "
         f"max={stats['max']:.6f} "
-        f"absmax={stats['absmax']:.6f}@loc={stats['absmax_loc']} "
         f"first5={stats['first5']} "
         f"last5={stats['last5']}"
     )
