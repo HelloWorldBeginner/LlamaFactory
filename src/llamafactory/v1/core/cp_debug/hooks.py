@@ -54,6 +54,10 @@ class CPDebugConfig:
     # 过滤
     module_filter: Optional[str] = None
 
+    # 写盘 rank：只有该 rank 落盘（其余 rank 仍参与 all-gather）。默认 0。
+    # 两边各自设以对齐同一样本：如 CP1 设 1（dp_rank 1）、CP2 设 2（dp_rank 1 的 cp_rank 0）。
+    debug_rank: int = 0
+
     # Step 控制
     auto_step: bool = True
 
@@ -75,6 +79,8 @@ class CPDebugConfig:
             self.expected_seq_len = int(env["CP_DEBUG_SEQ_LEN"])
         if "CP_DEBUG_MODULE_FILTER" in env:
             self.module_filter = env["CP_DEBUG_MODULE_FILTER"]
+        if "CP_DEBUG_RANK" in env:
+            self.debug_rank = int(env["CP_DEBUG_RANK"])
         if "CP_DEBUG_RECORD" in env:
             self.record = env["CP_DEBUG_RECORD"]
         if "CP_DEBUG_PRINT_FILE" in env:
@@ -240,7 +246,7 @@ class CPDebugManager:
 
         if all_none:
             # 两端都 None：写哨兵，让 compare 能确认一致（不走 all-gather）
-            if dist.is_initialized() and dist.get_rank() != 0:
+            if dist.is_initialized() and dist.get_rank() != self.config.debug_rank:
                 return
             dump_path = Path(self.config.dump_dir) / f"step{step}"
             dump_path.mkdir(parents=True, exist_ok=True)
@@ -249,7 +255,7 @@ class CPDebugManager:
 
         if not all_tensor:
             # 混合 None/tensor → 跳过避免死锁
-            if dist.is_initialized() and dist.get_rank() == 0:
+            if dist.is_initialized() and dist.get_rank() == self.config.debug_rank:
                 print(
                     f"[CP_DEBUG] root kwarg '{key}' mixed None/tensor across CP ranks; "
                     f"skipping to avoid all-gather deadlock",
@@ -309,8 +315,8 @@ class CPDebugManager:
                     self.config.default_seq_gather_dim
                 )
 
-            # all-gather 是集合通信，所有 rank 都必须参与；写盘只在 rank0
-            if dist.is_initialized() and dist.get_rank() != 0:
+            # all-gather 是集合通信，所有 rank 都必须参与；写盘只在 debug_rank
+            if dist.is_initialized() and dist.get_rank() != self.config.debug_rank:
                 return
 
             idx = self._step_record_count.get(step, 0)
