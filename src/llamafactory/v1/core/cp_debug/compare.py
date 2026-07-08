@@ -16,9 +16,32 @@ CP Debug 对比脚本
 """
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import torch
+
+
+class _Tee:
+    """同时写多个流（stdout + 文件），让所有 print 自动双写。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        return len(data) if data else 0
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
 
 
 def _step_dir(dump_dir: Path, step: int, dp_rank: Optional[int] = None) -> Path:
@@ -340,6 +363,9 @@ def main():
     parser.add_argument("--diff-only", action="store_true", help="只显示不一致的模块")
     parser.add_argument("--gradients", action="store_true", help="包含梯度对比")
     parser.add_argument("--detail", action="store_true", help="显示完整 tensor diff")
+    parser.add_argument("--out-dir", type=Path, default=Path("./cp_compare"),
+                        help="结果日志目录（自动创建），默认 ./cp_compare")
+    parser.add_argument("--no-out", action="store_true", help="不写文件，只打屏")
 
     args = parser.parse_args()
 
@@ -350,33 +376,50 @@ def main():
         print(f"Error: {args.dir2} does not exist")
         sys.exit(1)
 
-    # 多 rank 布局：两边都有 dp_rank*/ 子目录 → 逐个比较，各自输出
-    ranks1 = discover_dp_ranks(args.dir1)
-    ranks2 = discover_dp_ranks(args.dir2)
-    if ranks1 and ranks2:
-        common = sorted(set(ranks1) & set(ranks2))
-        only1 = sorted(set(ranks1) - set(ranks2))
-        only2 = sorted(set(ranks2) - set(ranks1))
-        print(f"CP1 dp_ranks: {ranks1}  CP2 dp_ranks: {ranks2}  common: {common}")
-        if only1:
-            print(f"  only in CP1: {only1}")
-        if only2:
-            print(f"  only in CP2: {only2}")
-        if not common:
-            print("Error: no common dp_rank to compare")
-            sys.exit(1)
-        for r in common:
-            run_comparison(args.dir1, args.dir2, args.step, args, dp_rank=r)
-        return
+    # 结果同时打屏 + 写文件 cp_compare/compare_{时间戳}.log
+    log_fh = None
+    orig_stdout = sys.stdout
+    if not args.no_out:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = args.out_dir / f"compare_{ts}.log"
+        log_fh = open(log_path, "w", encoding="utf-8")
+        sys.stdout = _Tee(orig_stdout, log_fh)
+        print(f"# CP Debug compare log\n# CP1: {args.dir1}\n# CP2: {args.dir2}\n# step: {args.step}  threshold: {args.threshold}\n# written: {log_path}\n")
 
-    # 旧布局（单 rank，step{S}/ 在根）：直接比；若一边多 rank 一边旧布局，提示
-    if ranks1 and not ranks2:
-        print(f"Error: {args.dir1} is multi-rank layout (dp_rank*/), but {args.dir2} is flat. 重新用同版本 dump。")
-        sys.exit(1)
-    if ranks2 and not ranks1:
-        print(f"Error: {args.dir2} is multi-rank layout (dp_rank*/), but {args.dir1} is flat. 重新用同版本 dump。")
-        sys.exit(1)
-    run_comparison(args.dir1, args.dir2, args.step, args, dp_rank=None)
+    # 多 rank 布局：两边都有 dp_rank*/ 子目录 → 逐个比较，各自输出
+    try:
+        ranks1 = discover_dp_ranks(args.dir1)
+        ranks2 = discover_dp_ranks(args.dir2)
+        if ranks1 and ranks2:
+            common = sorted(set(ranks1) & set(ranks2))
+            only1 = sorted(set(ranks1) - set(ranks2))
+            only2 = sorted(set(ranks2) - set(ranks1))
+            print(f"CP1 dp_ranks: {ranks1}  CP2 dp_ranks: {ranks2}  common: {common}")
+            if only1:
+                print(f"  only in CP1: {only1}")
+            if only2:
+                print(f"  only in CP2: {only2}")
+            if not common:
+                print("Error: no common dp_rank to compare")
+                sys.exit(1)
+            for r in common:
+                run_comparison(args.dir1, args.dir2, args.step, args, dp_rank=r)
+        else:
+            # 旧布局（单 rank，step{S}/ 在根）：直接比；一边多 rank 一边旧布局则报错
+            if ranks1 and not ranks2:
+                print(f"Error: {args.dir1} is multi-rank layout (dp_rank*/), but {args.dir2} is flat. 重新用同版本 dump。")
+                sys.exit(1)
+            if ranks2 and not ranks1:
+                print(f"Error: {args.dir2} is multi-rank layout (dp_rank*/), but {args.dir1} is flat. 重新用同版本 dump。")
+                sys.exit(1)
+            run_comparison(args.dir1, args.dir2, args.step, args, dp_rank=None)
+    finally:
+        # 恢复 stdout，关闭日志文件，打印落盘路径
+        sys.stdout = orig_stdout
+        if log_fh is not None:
+            log_fh.close()
+            print(f"\n[compare] 结果已写入: {log_path}")
 
 
 if __name__ == "__main__":
