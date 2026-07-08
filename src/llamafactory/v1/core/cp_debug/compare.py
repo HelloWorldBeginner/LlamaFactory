@@ -15,6 +15,7 @@ CP Debug 对比脚本
 出现的多维坐标）。--detail 下额外打印该位置上 CP1/CP2 的原始值与有符号差。
 """
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -316,13 +317,13 @@ def run_comparison(dir1: Path, dir2: Path, step: int, args, dp_rank: Optional[in
 
     where = f"dp_rank{dp_rank}/" if dp_rank is not None else ""
     if not tensors1 and not tensors2:
-        return False
+        return None
     if not tensors1:
         print(f"Error: No tensors in {dir1}/{where}step{step}")
-        return False
+        return None
     if not tensors2:
         print(f"Error: No tensors in {dir2}/{where}step{step}")
-        return False
+        return None
 
     header = f"=== CP Debug Comparison: step {step}"
     if dp_rank is not None:
@@ -358,15 +359,29 @@ def run_comparison(dir1: Path, dir2: Path, step: int, args, dp_rank: Optional[in
             print_results(category, results)
 
     print_summary(all_results)
-    return True
+    # 返回 summary 供并行模式汇总
+    summary = {}
+    for category, results in all_results.items():
+        ok = sum(1 for r in results if r[1] == "OK")
+        fail = sum(1 for r in results if r[1] == "FAIL")
+        first_fail = next((r[0] for r in results if r[1] == "FAIL"), None)
+        summary[category] = {"ok": ok, "fail": fail, "first_fail": first_fail}
+    return summary
 
 
 def _run_with_log(dir1: Path, dir2: Path, step: int, args, dp_rank: Optional[int],
-                  out_dir: Path, ts: str) -> bool:
-    """跑单个 dp_rank 的对比：屏幕照常输出，同时写一份单独的 per-dp_rank 日志文件。"""
+                  out_dir: Path, ts: str, quiet: bool = False):
+    """跑单个 dp_rank 的对比：写一份单独的 per-dp_rank 日志文件。
+
+    quiet=True 时（并行 worker）不向屏幕输出，只写文件；返回 summary 供主进程汇总。
+    """
     log_fh = None
     log_path = None
     orig_stdout = sys.stdout
+    if quiet:
+        # 并行 worker：屏幕输出丢弃，只写文件
+        sys.stdout = open(os.devnull, "w")
+        orig_stdout = sys.stdout
     if not args.no_out:
         out_dir.mkdir(parents=True, exist_ok=True)
         suffix = f"dp_rank{dp_rank}_" if dp_rank is not None else ""
@@ -376,13 +391,35 @@ def _run_with_log(dir1: Path, dir2: Path, step: int, args, dp_rank: Optional[int
         where = f"dp_rank{dp_rank}/" if dp_rank is not None else ""
         print(f"# CP Debug compare log\n# CP1: {dir1}\n# CP2: {dir2}\n# step: {step}  threshold: {args.threshold}  {where}\n# written: {log_path}\n")
     try:
-        ok = run_comparison(dir1, dir2, step, args, dp_rank)
+        summary = run_comparison(dir1, dir2, step, args, dp_rank)
     finally:
-        sys.stdout = orig_stdout
+        sys.stdout = orig_stdout if not quiet else sys.__stdout__
         if log_fh is not None:
             log_fh.close()
-            print(f"[compare] dp_rank{dp_rank if dp_rank is not None else '-'} 结果已写入: {log_path}")
-    return ok
+            if not quiet:
+                print(f"[compare] dp_rank{dp_rank if dp_rank is not None else '-'} 结果已写入: {log_path}")
+    return summary, log_path
+
+
+def _compare_worker(payload):
+    """并行 worker：跑单个 dp_rank，返回 (dp_rank, summary, log_path)。"""
+    dp_rank, kwargs = payload
+    summary, log_path = _run_with_log(quiet=True, **kwargs)
+    return dp_rank, summary, log_path
+
+
+def _fmt_summary_line(dp_rank: Optional[int], summary, log_path) -> str:
+    """把单个 dp_rank 的 summary 压成一行汇总。"""
+    label = f"dp_rank{dp_rank}" if dp_rank is not None else "flat"
+    if not summary:
+        return f"  {label}: 无数据"
+    parts = []
+    for cat in ("Forward", "Backward", "Weights"):
+        if cat in summary:
+            s = summary[cat]
+            ff = f" First:{s['first_fail']}" if s["first_fail"] else ""
+            parts.append(f"{cat}={s['ok']}OK/{s['fail']}FAIL{ff}")
+    return f"  {label}: " + " | ".join(parts) + (f"  -> {log_path}" if log_path else "")
 
 
 def main():
@@ -397,6 +434,8 @@ def main():
     parser.add_argument("--out-dir", type=Path, default=Path("./cp_compare"),
                         help="结果日志目录（自动创建），默认 ./cp_compare")
     parser.add_argument("--no-out", action="store_true", help="不写文件，只打屏")
+    parser.add_argument("--jobs", type=int, default=0,
+                        help="并行 worker 数（每个 dp_rank 一个进程）。0=自动（有几个 dp_rank 就几个，默认）；1=串行全量打屏；>1=并行，各 dp_rank 写各 log，主进程汇总打屏")
 
     args = parser.parse_args()
 
@@ -408,8 +447,7 @@ def main():
         sys.exit(1)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 屏幕先打一个总头（不写进 per-dp_rank 文件）
-    print(f"######## CP Debug compare: CP1={args.dir1}  CP2={args.dir2}  step={args.step}  threshold={args.threshold} ########")
+    print(f"######## CP Debug compare: CP1={args.dir1}  CP2={args.dir2}  step={args.step}  threshold={args.threshold}  jobs={args.jobs} ########")
 
     ranks1 = discover_dp_ranks(args.dir1)
     ranks2 = discover_dp_ranks(args.dir2)
@@ -426,9 +464,24 @@ def main():
         if not common:
             print("Error: no common dp_rank to compare")
             sys.exit(1)
-        # 每个 dp_rank 单独写一个日志文件；屏幕合在一起输出
-        for r in common:
-            _run_with_log(args.dir1, args.dir2, args.step, args, dp_rank=r, out_dir=args.out_dir, ts=ts)
+
+        if args.jobs != 1:
+            # 并行：每个 dp_rank 一个进程，各写各的 log，主进程汇总
+            from concurrent.futures import ProcessPoolExecutor
+            n_workers = len(common) if args.jobs <= 0 else min(args.jobs, len(common))
+            payloads = [(r, {"dir1": args.dir1, "dir2": args.dir2, "step": args.step,
+                             "args": args, "dp_rank": r, "out_dir": args.out_dir, "ts": ts})
+                        for r in common]
+            print(f"[compare] 并行 {n_workers} worker 跑 {len(common)} 个 dp_rank ...")
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                results = list(ex.map(_compare_worker, payloads))
+            print("\n========== 汇总 ==========")
+            for r, summary, log_path in results:
+                print(_fmt_summary_line(r, summary, log_path))
+        else:
+            # 串行：全量打屏 + 各 dp_rank log
+            for r in common:
+                _run_with_log(args.dir1, args.dir2, args.step, args, dp_rank=r, out_dir=args.out_dir, ts=ts)
         return
 
     # 旧布局（单 rank，step{S}/ 在根）：直接比；一边多 rank 一边旧布局则报错
