@@ -47,6 +47,10 @@ class CPDebugConfig:
     # 每个 cp_rank 各写一个日志文件 {dump_dir}/dp_rank{D}_cp_rank{C}_{ts}.log。
     # 选 dp_rank 用 CP_DEBUG_DP_RANK；CP2 下该 dp_rank 的 rank0/rank1 各一个文件，CP1 只 cp_rank0。
     raw_print: bool = False
+    # 动态 seq 长度检测（LlamaFactory 专属）：每步从 root forward 的 input_ids([bs,seqlen])
+    # 读 seqlen，动态更新 expected_seq_len = local_seq * cp_size，使变长下 all-gather 仍能拼回全长。
+    # 需配合 CP_DEBUG_PAD_TO_CUTOFF=0（不 pad 到 cutoff）。env CP_DEBUG_AUTO_SEQ_LEN=1。
+    auto_seq_len: bool = False
 
     # 以下三项由 `record` 在 __post_init__ 中派生，不要直接设置
     record_forward: bool = field(default=False, init=False)
@@ -104,6 +108,8 @@ class CPDebugConfig:
             self.raw_print = True
             # raw_print：不 pad、不 gather。强制关掉 pad_to_cutoff（pad_and_truncate 读此 env）。
             env["CP_DEBUG_PAD_TO_CUTOFF"] = "0"
+        if env.get("CP_DEBUG_AUTO_SEQ_LEN", "0") == "1":
+            self.auto_seq_len = True
 
         # raw_print 模式：每个 cp_rank 各写一个日志文件，文件名带 dp_rank/cp_rank。
         # 非 raw_print：print/both 模式默认单文件 {dump_dir}/cp{cp_size}_{ts}.log。
@@ -224,6 +230,14 @@ class CPDebugManager:
             if not self._first_forward:
                 self._auto_step += 1
             self._first_forward = False
+
+        # 动态 seq 长度检测（LlamaFactory 专属）：每步从 input_ids([bs,seqlen]) 读 seqlen，
+        # 更新 expected_seq_len = local_seq * cp_size，使变长下 all-gather 仍能拼回全长。
+        # 必须在子模块 forward hook 调 record() 之前完成。
+        if self.config.auto_seq_len and kwargs:
+            ii = kwargs.get("input_ids")
+            if isinstance(ii, torch.Tensor) and ii.ndim >= 2:
+                self.config.expected_seq_len = int(ii.shape[-1]) * self._cp_world()
 
         if self.config.print_weights and not self._weights_recorded and not self.config.raw_print:
             self._model_ref = module
