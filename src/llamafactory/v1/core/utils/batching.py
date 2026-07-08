@@ -24,6 +24,7 @@
 """
 
 from collections.abc import Iterator
+import os
 from typing import Any
 
 import torch
@@ -127,11 +128,13 @@ class BatchGenerator(Iterator):
 
     def _init_data_provider(self) -> None:
         if len(self.dataset) != -1:
+            # env DISABLE_SHUFFLE=1 关闭打乱，用于 CP1/CP2 精度对比时让 step N 恒为同一样本。
+            shuffle = os.environ.get("DISABLE_SHUFFLE", "0") != "1"
             sampler = StatefulDistributedSampler(
                 self.dataset,
                 num_replicas=DistributedInterface().get_world_size(Dim.DP),
                 rank=DistributedInterface().get_rank(Dim.DP),
-                shuffle=True,
+                shuffle=shuffle,
                 seed=self.seed,
                 drop_last=self.drop_last,
             )
