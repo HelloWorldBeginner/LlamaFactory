@@ -43,6 +43,10 @@ class CPDebugConfig:
     print_full_tensor: bool = False
     # print 模式下，每条输出同时追加到此文件（None 时 print/both 模式默认 {dump_dir}/print.log）
     print_file: Optional[str] = None
+    # 原始本地打印：不 pad、不 all-gather、不算统计，直接把每个 rank 的本地 tensor 原样打印；
+    # 每个 cp_rank 各写一个日志文件 {dump_dir}/dp_rank{D}_cp_rank{C}_{ts}.log。
+    # 选 dp_rank 用 CP_DEBUG_DP_RANK；CP2 下该 dp_rank 的 rank0/rank1 各一个文件，CP1 只 cp_rank0。
+    raw_print: bool = False
 
     # 以下三项由 `record` 在 __post_init__ 中派生，不要直接设置
     record_forward: bool = field(default=False, init=False)
@@ -96,20 +100,32 @@ class CPDebugConfig:
             self.record = env["CP_DEBUG_RECORD"]
         if "CP_DEBUG_PRINT_FILE" in env:
             self.print_file = env["CP_DEBUG_PRINT_FILE"]
-        # print/both 模式下，若未显式指定 print_file，默认落到
-        # {dump_dir}/cp{cp_size}_{时间戳}.log（cp_size 取自 cp_group，CP1 为 1；
-        # 时间戳在 config 初始化时取一次，整个 run 写同一文件；目录由 _print 自动创建）
-        if self.print_file is None and self.mode in ("print", "both"):
+        if env.get("CP_DEBUG_RAW_PRINT", "0") == "1":
+            self.raw_print = True
+            # raw_print：不 pad、不 gather。强制关掉 pad_to_cutoff（pad_and_truncate 读此 env）。
+            env["CP_DEBUG_PAD_TO_CUTOFF"] = "0"
+
+        # raw_print 模式：每个 cp_rank 各写一个日志文件，文件名带 dp_rank/cp_rank。
+        # 非 raw_print：print/both 模式默认单文件 {dump_dir}/cp{cp_size}_{ts}.log。
+        if self.print_file is None:
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             try:
                 if self.cp_group is not None and dist.is_initialized():
                     cp_size = dist.get_world_size(self.cp_group)
+                    cp_rank = dist.get_rank(self.cp_group)
                 else:
-                    cp_size = 1
+                    cp_size, cp_rank = 1, 0
+                if self.dp_group is not None and dist.is_initialized():
+                    dp_rank = dist.get_rank(self.dp_group)
+                else:
+                    dp_rank = 0
             except Exception:
-                cp_size = 1
-            from datetime import datetime
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.print_file = str(Path(self.dump_dir) / f"cp{cp_size}_{ts}.log")
+                cp_size, cp_rank, dp_rank = 1, 0, 0
+            if self.raw_print:
+                self.print_file = str(Path(self.dump_dir) / f"dp_rank{dp_rank}_cp_rank{cp_rank}_{ts}.log")
+            elif self.mode in ("print", "both"):
+                self.print_file = str(Path(self.dump_dir) / f"cp{cp_size}_{ts}.log")
 
         # 校验枚举字段
         if self.mode not in ("print", "dump", "both"):
@@ -209,7 +225,7 @@ class CPDebugManager:
                 self._auto_step += 1
             self._first_forward = False
 
-        if self.config.print_weights and not self._weights_recorded:
+        if self.config.print_weights and not self._weights_recorded and not self.config.raw_print:
             self._model_ref = module
             self._record_all_weights(module)
             self._weights_recorded = True
@@ -255,6 +271,12 @@ class CPDebugManager:
             return True
         return self._dp_rank() in self.config.debug_dp_ranks
 
+    def _should_write_raw(self) -> bool:
+        """raw_print：选定 dp_rank 的所有 cp_rank 都写（CP2 下 rank0/rank1 各一份）。"""
+        if self.config.debug_dp_ranks is None:
+            return True
+        return self._dp_rank() in self.config.debug_dp_ranks
+
     def _dump_dir(self, step: int) -> Path:
         """按 dp_rank 分目录：{dump_dir}/dp_rank{D}/step{S}/"""
         return Path(self.config.dump_dir) / f"dp_rank{self._dp_rank()}" / f"step{step}"
@@ -270,6 +292,16 @@ class CPDebugManager:
         - 混合 → 跳过 + 告警，避免死锁。
         """
         is_tensor = isinstance(val, torch.Tensor)
+        # raw_print：直接原样打印本地值（None 也打印出来），不 gather、不分哨兵。
+        if self.config.raw_print:
+            if not self._should_write_raw():
+                return
+            if is_tensor:
+                self._print(f"[STEP {step}] model.{key} shape={list(val.shape)}:\n{val.cpu()}")
+            else:
+                self._print(f"[STEP {step}] model.{key} = {val!r}")
+            return
+
         cp_group = self.get_cp_group()
         if cp_group is not None and dist.is_initialized():
             sp = dist.get_world_size(cp_group)
@@ -343,6 +375,16 @@ class CPDebugManager:
         """
         with torch.no_grad():
             tensor = tensor.detach()
+
+            # raw_print：不 gather、不算统计、不落 .pt，直接把本地 tensor 原样打印；
+            # 选定 dp_rank 的所有 cp_rank 各写各的文件。权重/梯度跳过（太大）。
+            if self.config.raw_print:
+                if hook_type in ("weight", "param_grad"):
+                    return
+                if not self._should_write_raw():
+                    return
+                self._print(f"[STEP {step}] {name} ({hook_type}) shape={list(tensor.shape)}:\n{tensor.cpu()}")
+                return
 
             if hook_type in ("weight", "param_grad"):
                 gathered = tensor
