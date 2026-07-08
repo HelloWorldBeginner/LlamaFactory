@@ -40,8 +40,7 @@ class CPDebugConfig:
 
     # 功能
     print_weights: bool = True
-    # 每个被记录的 step 都 dump 一份当前权重（看训练后漂移）；原始权重(step0)始终记。
-    # 量大可关：CP_DEBUG_WEIGHTS_PER_STEP=0
+    # 每个被记录的 step 都 dump 一份当前权重（看训练后漂移）。量大可关：CP_DEBUG_WEIGHTS_PER_STEP=0
     dump_weights_per_step: bool = True
     print_full_tensor: bool = False
     # print 模式下，每条输出同时追加到此文件（None 时 print/both 模式默认 {dump_dir}/print.log）
@@ -243,10 +242,12 @@ class CPDebugManager:
             if isinstance(ii, torch.Tensor) and ii.ndim >= 2:
                 self.config.expected_seq_len = int(ii.shape[-1]) * self._cp_world()
 
-        # 原始权重（init 快照，step 0）：首次 forward 时记录一次（此时还未 optimizer.step，即初始权重）
+        # 原始/init 权重（step 0）：首次 forward 时记录一次（此时还未 optimizer.step，即初始权重）。
+        # 仅当 CP_DEBUG_STEPS 显式含 0（如 CP_DEBUG_STEPS=0 或 0,1）才记；不含 0 则不记，避免多余的 step0。
         if self.config.print_weights and not self._weights_recorded and not self.config.raw_print:
-            self._model_ref = module
-            self._record_all_weights(module, step=0)
+            if self.config.step_range is not None and self.should_record(0):
+                self._model_ref = module
+                self._record_all_weights(module, step=0)
             self._weights_recorded = True
         # 当前 step 权重：每个被记录的 step 都记一份，看训练后权重漂移
         if self.config.dump_weights_per_step and not self.config.raw_print and self.should_record():
