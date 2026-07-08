@@ -40,6 +40,9 @@ class CPDebugConfig:
 
     # 功能
     print_weights: bool = True
+    # 每个被记录的 step 都 dump 一份当前权重（看训练后漂移）；原始权重(step0)始终记。
+    # 量大可关：CP_DEBUG_WEIGHTS_PER_STEP=0
+    dump_weights_per_step: bool = True
     print_full_tensor: bool = False
     # print 模式下，每条输出同时追加到此文件（None 时 print/both 模式默认 {dump_dir}/print.log）
     print_file: Optional[str] = None
@@ -110,6 +113,8 @@ class CPDebugConfig:
             env["CP_DEBUG_PAD_TO_CUTOFF"] = "0"
         if env.get("CP_DEBUG_AUTO_SEQ_LEN", "0") == "1":
             self.auto_seq_len = True
+        if env.get("CP_DEBUG_WEIGHTS_PER_STEP", "1") == "0":
+            self.dump_weights_per_step = False
 
         # raw_print 模式：每个 cp_rank 各写一个日志文件，文件名带 dp_rank/cp_rank。
         # 非 raw_print：print/both 模式默认单文件 {dump_dir}/cp{cp_size}_{ts}.log。
@@ -238,10 +243,14 @@ class CPDebugManager:
             if isinstance(ii, torch.Tensor) and ii.ndim >= 2:
                 self.config.expected_seq_len = int(ii.shape[-1]) * self._cp_world()
 
-        if self.config.print_weights and not self._weights_recorded and not self.config.raw_print and self.should_record():
+        # 原始权重（init 快照，step 0）：首次 forward 时记录一次（此时还未 optimizer.step，即初始权重）
+        if self.config.print_weights and not self._weights_recorded and not self.config.raw_print:
             self._model_ref = module
-            self._record_all_weights(module)
+            self._record_all_weights(module, step=0)
             self._weights_recorded = True
+        # 当前 step 权重：每个被记录的 step 都记一份，看训练后权重漂移
+        if self.config.dump_weights_per_step and not self.config.raw_print and self.should_record():
+            self._record_all_weights(module, step=self.get_step())
 
         # 捕获 forward kwargs（HF 当 kwargs 传，位置 hook 抓不到；None 安全）
         if kwargs and self.should_record():
@@ -536,8 +545,8 @@ class CPDebugManager:
         # 梯度收集是一个 step 的收尾，刷新该 step 的执行顺序汇总
         self.flush(step)
 
-    def _record_all_weights(self, model: nn.Module):
-        """延迟记录所有权重（在第一次 forward 时调用，确保权重已物化）"""
+    def _record_all_weights(self, model: nn.Module, step: int):
+        """记录所有权重到 step{step}/（每次调用都全量记录，不跨调用去重）。"""
         module_filter_re = None
         if self.config.module_filter:
             module_filter_re = re.compile(self.config.module_filter)
@@ -545,7 +554,7 @@ class CPDebugManager:
         for name, module in model.named_modules():
             if module_filter_re and not module_filter_re.search(name):
                 continue
-            _record_weights(self, name, module)
+            _record_weights(self, name, module, step)
 
 
 def register_cp_debug_hooks(
@@ -632,19 +641,15 @@ def _make_forward_hook(manager: CPDebugManager, module_name: str) -> Callable:
     return hook_fn
 
 
-def _record_weights(manager: CPDebugManager, module_name: str, module: nn.Module):
-    """记录模块权重"""
+def _record_weights(manager: CPDebugManager, module_name: str, module: nn.Module, step: int):
+    """记录模块权重到 step{step}/"""
     for param_name, param in module.named_parameters(recurse=False):
         if param is None:
             continue
 
         full_name = f"{module_name}.{param_name}" if module_name else param_name
 
-        if full_name in manager._printed_weights:
-            continue
-        manager._printed_weights.add(full_name)
-
         if hasattr(param, 'full_tensor'):
             param = param.full_tensor()
 
-        manager.record(full_name, param, manager.get_step(), hook_type="weight")
+        manager.record(full_name, param, step, hook_type="weight")
