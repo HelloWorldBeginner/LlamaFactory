@@ -269,10 +269,11 @@ def print_results(
         return
 
     print(f"\n--- {category} ---")
-    print(f"{'Module':<46} {'Status':<13} {'Max Diff':<10} {'Mean Diff':<10} {'Max Gap':<10} {'Min Gap':<10} {'Max Loc':<22}")
-    print("-" * 122)
+    print(f"{'Module':<42} {'Shape':<20} {'Status':<13} {'Max Diff':<10} {'Mean Diff':<10} {'Max Gap':<10} {'Min Gap':<10} {'Max Loc':<20}")
+    print("-" * 136)
 
     for name, status, max_diff, mean_diff, max_loc, val1, val2, max_gap, min_gap, shape in results:
+        shape_str = str(shape) if shape is not None else "-"
         if status == "SHAPE_MISMATCH":
             max_str = "SHAPE"; mean_str = "MISMATCH"; gap_str = "-"; mgap_str = "-"; loc_str = "-"
         elif status in ("ONLY_IN_CP1", "ONLY_IN_CP2"):
@@ -284,7 +285,7 @@ def print_results(
             mgap_str = f"{min_gap:.2e}"
             loc_str = str(max_loc) if max_loc is not None else "-"
 
-        print(f"{name:<46} {status:<13} {max_str:<10} {mean_str:<10} {gap_str:<10} {mgap_str:<10} {loc_str:<22}")
+        print(f"{name:<42} {shape_str:<20} {status:<13} {max_str:<10} {mean_str:<10} {gap_str:<10} {mgap_str:<10} {loc_str:<20}")
 
 
 def print_summary(all_results: Dict[str, List[Tuple[str, str, float, float]]]):
