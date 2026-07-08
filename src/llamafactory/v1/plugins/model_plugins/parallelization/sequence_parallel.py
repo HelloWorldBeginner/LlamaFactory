@@ -177,6 +177,35 @@ def padding_and_split_data(data, device_mesh=None):
     return data
 
 
+def round_pad_data(data, align_size=1):
+    """仅 round-pad 到 align_size 倍数（不切分），用于让 CP1（cp_size=1）数据形状对齐 CP2。
+
+    pad 值与 padding_and_split_data 的 round_pad 段一致：attention_mask=1、labels=-100、
+    position_ids 续位、loss_weights=0、其余 0。这些位置 causal 隔离、不参与 loss。
+    诊断用：CP1 设 env CP_ALIGN_ROUND_PAD=2 调用此函数，验证 round_pad 是否为精度差异来源。
+    """
+    if align_size <= 1:
+        return data
+    for k, v in data.items():
+        if isinstance(v, torch.Tensor) and v.ndim > 1:
+            round_pad = (align_size - v.shape[-1] % align_size) % align_size
+            if round_pad == 0:
+                continue
+            if k in ("labels", "shift_labels"):
+                data[k] = F.pad(v, (0, round_pad), value=-100)
+            elif k in ("loss_weights", "shift_loss_weights"):
+                data[k] = F.pad(v, (0, round_pad), value=0.0)
+            elif k == "attention_mask":
+                data[k] = F.pad(v, (0, round_pad), value=1)
+            elif k == "position_ids":
+                last_pos = v[..., -1:]
+                cont = last_pos + torch.arange(1, round_pad + 1, device=v.device, dtype=v.dtype)
+                data[k] = torch.cat([v, cont], dim=-1)
+            else:
+                data[k] = F.pad(v, (0, round_pad), value=0)
+    return data
+
+
 @SequenceParallelLossPlugin("sequence_parallel_loss").register()
 def sequence_parallel_loss(model, model_inputs):
     device_mesh = DistributedInterface().get_device_mesh(Dim.CP)

@@ -28,6 +28,7 @@ Train Phase:
 """
 
 from abc import abstractmethod
+import os
 
 import torch
 import torch.nn.functional as F
@@ -73,6 +74,8 @@ class BaseTrainer:
         self.device = DistributedInterface().current_device
         self.dp_size = DistributedInterface().get_world_size(Dim.DP)
         self.cp_size = DistributedInterface().get_world_size(Dim.CP)
+        # 诊断开关：CP1 也按 CP2 方式 round-pad（env CP_ALIGN_ROUND_PAD，如 2）
+        self._cp_align_round_pad = int(os.environ.get("CP_ALIGN_ROUND_PAD", "0"))
         self.model_input_names = self.renderer.processor.model_input_names
 
         self._create_batch_generator()
@@ -355,6 +358,13 @@ class BaseTrainer:
 
                         loss = SequenceParallelLossPlugin("sequence_parallel_loss")(self.model, micro_batch)
                     else:
+                        # 诊断：让 CP1 也按 CP2 的方式 round-pad（不切分），验证 pad 是否为精度差异来源。
+                        # env CP_ALIGN_ROUND_PAD=N（如 2），CP1 数据 round-pad 到 N 倍数。
+                        if self._cp_align_round_pad > 1:
+                            from ..plugins.model_plugins.parallelization.sequence_parallel import (
+                                round_pad_data,
+                            )
+                            micro_batch = round_pad_data(micro_batch, self._cp_align_round_pad)
                         loss = self.compute_loss(micro_batch)
                     raw_loss = loss.item()
                     mini_step_valid_tokens = compute_valid_tokens([micro_batch])
