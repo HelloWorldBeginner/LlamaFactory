@@ -227,9 +227,8 @@ class CPDebugManager:
         if self._in_backward:
             return
         if self.config.auto_step:
-            if not self._first_forward:
-                self._auto_step += 1
-            self._first_forward = False
+            # 1-indexed：首次 forward = step 1，与训练日志 global_step 对齐。
+            self._auto_step += 1
 
         # 动态 seq 长度检测（LlamaFactory 专属）：每步从 input_ids([bs,seqlen]) 读 seqlen，
         # 更新 expected_seq_len = local_seq * cp_size，使变长下 all-gather 仍能拼回全长。
@@ -364,7 +363,8 @@ class CPDebugManager:
             elif isinstance(self.config.step_range, list):
                 return step in self.config.step_range
 
-        return step < self.config.max_steps
+        # max_steps 是"记录前 N 步"的计数；step 1-indexed → 记录 step 1..max_steps
+        return step <= self.config.max_steps
 
     def get_cp_group(self) -> Optional[Any]:
         """获取 CP group"""

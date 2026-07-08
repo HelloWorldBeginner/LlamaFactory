@@ -389,7 +389,7 @@ def main():
     parser = argparse.ArgumentParser(description="CP Debug 对比工具")
     parser.add_argument("dir1", type=Path, help="CP1 dump 目录")
     parser.add_argument("dir2", type=Path, help="CP2 dump 目录")
-    parser.add_argument("--step", type=int, default=0, help="对比特定 step（默认 0）")
+    parser.add_argument("--step", type=int, default=1, help="对比特定 step（默认 1，与训练日志 global_step 对齐）")
     parser.add_argument("--threshold", type=float, default=1e-5, help="差异阈值（默认 1e-5）")
     parser.add_argument("--diff-only", action="store_true", help="只显示不一致的模块")
     parser.add_argument("--gradients", action="store_true", help="包含梯度对比")
