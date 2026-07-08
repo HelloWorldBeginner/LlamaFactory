@@ -238,7 +238,7 @@ class CPDebugManager:
             if isinstance(ii, torch.Tensor) and ii.ndim >= 2:
                 self.config.expected_seq_len = int(ii.shape[-1]) * self._cp_world()
 
-        if self.config.print_weights and not self._weights_recorded and not self.config.raw_print:
+        if self.config.print_weights and not self._weights_recorded and not self.config.raw_print and self.should_record():
             self._model_ref = module
             self._record_all_weights(module)
             self._weights_recorded = True
@@ -647,4 +647,4 @@ def _record_weights(manager: CPDebugManager, module_name: str, module: nn.Module
         if hasattr(param, 'full_tensor'):
             param = param.full_tensor()
 
-        manager.record(full_name, param, 0, hook_type="weight")
+        manager.record(full_name, param, manager.get_step(), hook_type="weight")
