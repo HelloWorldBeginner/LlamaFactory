@@ -151,18 +151,20 @@ def compare_tensors(
     t1: torch.Tensor,
     t2: torch.Tensor,
     threshold: float = 1e-5
-) -> Tuple[str, float, float, Optional[tuple], float, float]:
+) -> Tuple:
     """
     对比两个 tensor（逐元素相减取绝对值）
 
     Returns:
-        (status, max_diff, mean_diff, max_loc, val1, val2)
+        (status, max_diff, mean_diff, max_loc, val1, val2, max_val_gap, min_val_gap)
         - max_diff: |t1 - t2| 的全局最大值
         - max_loc:  该最大值出现的多维坐标（SHAPE_MISMATCH 时为 None）
         - val1/val2: 该位置上 CP1 / CP2 的原始值
+        - max_val_gap: 两端最大值之差 |max(t1) - max(t2)|
+        - min_val_gap: 两端最小值之差 |min(t1) - min(t2)|
     """
     if t1.shape != t2.shape:
-        return ("SHAPE_MISMATCH", float('inf'), float('inf'), None, float('nan'), float('nan'))
+        return ("SHAPE_MISMATCH", float('inf'), float('inf'), None, float('nan'), float('nan'), float('nan'), float('nan'))
 
     t1f = t1.float()
     t2f = t2.float()
@@ -177,8 +179,12 @@ def compare_tensors(
     val1 = t1f[max_loc].item()
     val2 = t2f[max_loc].item()
 
+    # 两端整体最值之差（看 range 是否整体偏移）
+    max_val_gap = abs(t1f.max() - t2f.max()).item()
+    min_val_gap = abs(t1f.min() - t2f.min()).item()
+
     status = "OK" if max_diff < threshold else "FAIL"
-    return (status, max_diff, mean_diff, max_loc, val1, val2)
+    return (status, max_diff, mean_diff, max_loc, val1, val2, max_val_gap, min_val_gap)
 
 
 def categorize_tensors(tensors: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -211,7 +217,7 @@ def compare_category(
 ) -> List[Tuple]:
     """对比一个类别的所有 tensor
 
-    结果元组: (name, status, max_diff, mean_diff, max_loc, val1, val2)
+    结果元组: (name, status, max_diff, mean_diff, max_loc, val1, val2, max_val_gap, min_val_gap, shape)
     """
     results = []
 
@@ -224,30 +230,32 @@ def compare_category(
         t1 = tensors1[tensor_name]
         t2 = tensors2[tensor_name]
 
-        status, max_diff, mean_diff, max_loc, val1, val2 = compare_tensors(t1, t2, threshold)
+        status, max_diff, mean_diff, max_loc, val1, val2, max_gap, min_gap = compare_tensors(t1, t2, threshold)
+        shape = list(t1.shape)
 
         if not diff_only or status != "OK":
-            results.append((tensor_name, status, max_diff, mean_diff, max_loc, val1, val2))
+            results.append((tensor_name, status, max_diff, mean_diff, max_loc, val1, val2, max_gap, min_gap, shape))
 
             if status == "FAIL":
-                # FAIL 默认就打印最大误差位置 + 两端原始值（无需 --detail）
+                # FAIL 默认就打印 shape + 最大误差位置 + 两端原始值 + 最值差距（无需 --detail）
                 loc_str = str(max_loc) if max_loc is not None else "N/A"
-                print(f"  [FAIL] {tensor_name}: max|diff|={max_diff:.6e} at loc={loc_str}  "
-                      f"CP1={val1:.6e}  CP2={val2:.6e}  |diff|={abs(val1 - val2):.6e}")
+                print(f"  [FAIL] {tensor_name} shape={shape}: max|diff|={max_diff:.6e} at loc={loc_str}  "
+                      f"CP1={val1:.6e}  CP2={val2:.6e}  max_gap={max_gap:.6e}  min_gap={min_gap:.6e}")
                 if detail:
-                    diff = (t1.float() - t2.float()).abs()
-                    print(f"    CP1: shape={list(t1.shape)}, mean={t1.float().mean():.6f}")
-                    print(f"    CP2: shape={list(t2.shape)}, mean={t2.float().mean():.6f}")
-                    print(f"    Diff: mean={diff.mean():.6e}")
+                    t1f, t2f = t1.float(), t2.float()
+                    diff = (t1f - t2f).abs()
+                    print(f"    CP1: shape={shape}, mean={t1f.mean():.6f}, max={t1f.max():.6e}, min={t1f.min():.6e}")
+                    print(f"    CP2: shape={list(t2.shape)}, mean={t2f.mean():.6f}, max={t2f.max():.6e}, min={t2f.min():.6e}")
+                    print(f"    Diff: mean={diff.mean():.6e}, max_gap={max_gap:.6e}, min_gap={min_gap:.6e}")
 
     # 只在一个目录中的 tensor
     for tensor_name in sorted(only_in_1):
         if not diff_only:
-            results.append((tensor_name, "ONLY_IN_CP1", float('inf'), float('inf'), None, float('nan'), float('nan')))
+            results.append((tensor_name, "ONLY_IN_CP1", float('inf'), float('inf'), None, float('nan'), float('nan'), float('nan'), float('nan'), list(tensors1[tensor_name].shape)))
 
     for tensor_name in sorted(only_in_2):
         if not diff_only:
-            results.append((tensor_name, "ONLY_IN_CP2", float('inf'), float('inf'), None, float('nan'), float('nan')))
+            results.append((tensor_name, "ONLY_IN_CP2", float('inf'), float('inf'), None, float('nan'), float('nan'), float('nan'), float('nan'), list(tensors2[tensor_name].shape)))
 
     return results
 
@@ -261,24 +269,22 @@ def print_results(
         return
 
     print(f"\n--- {category} ---")
-    print(f"{'Module':<50} {'Status':<13} {'Max Diff':<11} {'Mean Diff':<11} {'Max Loc':<24}")
-    print("-" * 112)
+    print(f"{'Module':<46} {'Status':<13} {'Max Diff':<10} {'Mean Diff':<10} {'Max Gap':<10} {'Min Gap':<10} {'Max Loc':<22}")
+    print("-" * 122)
 
-    for name, status, max_diff, mean_diff, max_loc, val1, val2 in results:
+    for name, status, max_diff, mean_diff, max_loc, val1, val2, max_gap, min_gap, shape in results:
         if status == "SHAPE_MISMATCH":
-            max_str = "SHAPE"
-            mean_str = "MISMATCH"
-            loc_str = "-"
+            max_str = "SHAPE"; mean_str = "MISMATCH"; gap_str = "-"; mgap_str = "-"; loc_str = "-"
         elif status in ("ONLY_IN_CP1", "ONLY_IN_CP2"):
-            max_str = "-"
-            mean_str = "-"
-            loc_str = "-"
+            max_str = "-"; mean_str = "-"; gap_str = "-"; mgap_str = "-"; loc_str = "-"
         else:
             max_str = f"{max_diff:.2e}"
             mean_str = f"{mean_diff:.2e}"
+            gap_str = f"{max_gap:.2e}"
+            mgap_str = f"{min_gap:.2e}"
             loc_str = str(max_loc) if max_loc is not None else "-"
 
-        print(f"{name:<50} {status:<13} {max_str:<11} {mean_str:<11} {loc_str:<24}")
+        print(f"{name:<46} {status:<13} {max_str:<10} {mean_str:<10} {gap_str:<10} {mgap_str:<10} {loc_str:<22}")
 
 
 def print_summary(all_results: Dict[str, List[Tuple[str, str, float, float]]]):
