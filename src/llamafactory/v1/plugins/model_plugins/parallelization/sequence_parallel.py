@@ -154,7 +154,8 @@ def new_eager_attn_forward(
     if not getattr(new_eager_attn_forward, "_confirmed", False):
         new_eager_attn_forward._confirmed = True
         if dist.is_initialized() and dist.get_rank() == 0:
-            print("[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: gather_seq_scatter_heads (MindSpeed all_to_all_single)", flush=True)
+            a2a = "MindSpeed all_to_all_single" if os.environ.get("CP_A2A", "mindspeed") != "seqalltoall" else "SeqAllToAll4D"
+            print(f"[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: {a2a}", flush=True)
 
     # GQA 预复制（和 FA2 路径、MindSpeed 一致）
     num_attention_heads = module.config.num_attention_heads
@@ -166,9 +167,15 @@ def new_eager_attn_forward(
 
     # all-to-all: [bs, heads, seq_local, head_dim] -> [bs, heads/cp, full_seq, head_dim]
     full_seq = query.shape[2] * cp_size
-    q = gather_seq_scatter_heads(query, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
-    k = gather_seq_scatter_heads(key, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
-    v = gather_seq_scatter_heads(value, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+    use_ms = os.environ.get("CP_A2A", "mindspeed") != "seqalltoall"
+    if use_ms:
+        q = gather_seq_scatter_heads(query, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+        k = gather_seq_scatter_heads(key, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+        v = gather_seq_scatter_heads(value, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+    else:
+        q = SeqAllToAll4D.apply(group, query, 1, 2)
+        k = SeqAllToAll4D.apply(group, key, 1, 2)
+        v = SeqAllToAll4D.apply(group, value, 1, 2)
     full_seq = q.shape[2]
 
     # mask: 用传进来的 attention_mask 重建全长 4D causal+padding（还原，不用纯 causal）
@@ -177,7 +184,10 @@ def new_eager_attn_forward(
 
     attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
     # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
-    output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
+    if use_ms:
+        output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
+    else:
+        output = SeqAllToAll4D.apply(group, attn_output, 1, 2)
     return output, None
 
 
