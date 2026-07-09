@@ -163,7 +163,6 @@ def new_eager_attn_forward(
 @SequenceParallelModelPlugin("ulysses").register()
 def apply_sequence_parallel(model, model_args):
     # Replace attention forward with Ulysses CP wrapper, dispatched by _attn_implementation.
-    model_module = sys.modules[model.__module__]
     cp_size = model_args.get("cp_size", 1)
 
     set_ulysses_sequence_parallel_group(DistributedInterface().get_group(Dim.CP))
@@ -210,17 +209,25 @@ def apply_sequence_parallel(model, model_args):
             except (AttributeError, TypeError):
                 continue
     elif attn_impl in ("eager",):
-        # eager: patch 模型模块的 eager_attention_forward（get_interface("eager", default) 用它）
-        origin_eager = getattr(model_module, "eager_attention_forward", None)
+        # eager: patch modeling 模块的 eager_attention_forward（get_interface("eager", default) 用它）。
+        # FSDP2 包裹后 model.__module__ 是 fsdp 模块，要遍历子模块找真正的 modeling 模块。
+        eager_mod = None
+        origin_eager = None
+        for sub in model.modules():
+            mod = sys.modules.get(type(sub).__module__)
+            if mod is not None and hasattr(mod, "eager_attention_forward"):
+                eager_mod = mod
+                origin_eager = getattr(mod, "eager_attention_forward")
+                break
         if origin_eager is None:
             raise NotImplementedError(
-                f"CP eager needs `eager_attention_forward` in {model.__module__}; not found. "
+                "CP eager needs `eager_attention_forward` in the model's modeling module; not found. "
                 "确认模型支持 eager 后端。"
             )
         new_eager_attention_forward = partial(new_eager_attn_forward, attn_fn=origin_eager, group=group)
-        model_module.eager_attention_forward = new_eager_attention_forward
+        eager_mod.eager_attention_forward = new_eager_attention_forward
         logger.info_rank0(
-            f"Replaced eager_attention_forward in {model.__module__} with new_eager_attn_forward for sequence parallel."
+            f"Replaced eager_attention_forward in {eager_mod.__name__} with new_eager_attn_forward for sequence parallel."
         )
     else:
         raise NotImplementedError(
