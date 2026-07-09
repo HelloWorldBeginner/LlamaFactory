@@ -24,6 +24,10 @@ from ..utils.types import BatchInput, Tensor
 class SFTTrainer(BaseTrainer):
     def compute_loss(self, batch: BatchInput) -> Tensor:
         shift_loss_weights = batch["loss_weights"].to(self.device, non_blocking=True)[..., 1:]
+        # 诊断：写死 attention_mask=None，规避 mask 差异（和 CP2 路径一致）
+        import os
+        if os.environ.get("CP_NO_ATTENTION_MASK", "0") == "1":
+            batch.pop("attention_mask", None)
         log_probs = self.compute_log_probs(self.model, batch)
         loss = (-log_probs * shift_loss_weights).sum() / (shift_loss_weights.sum() + 1e-6)
         return loss
