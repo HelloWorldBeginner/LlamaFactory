@@ -33,6 +33,16 @@ from .ulysses import (
 )
 from .seq_comm import SeqAllToAll4D
 
+# 尝试导入 MindSpeed 的 all-to-all 接口（NPU 环境可用）；不可用时回退 SeqAllToAll4D
+try:
+    from mindspeed_llm.fsdp2.distributed.context_parallel.ulysses_context_parallel.utils import (
+        gather_heads_scatter_seq as _ms_gather_heads_scatter_seq,
+        gather_seq_scatter_heads as _ms_gather_seq_scatter_heads,
+    )
+    _HAS_MINDSPEED_A2A = True
+except Exception:
+    _HAS_MINDSPEED_A2A = False
+
 
 logger = logging.get_logger(__name__)
 
@@ -160,9 +170,15 @@ def new_eager_attn_forward(
         value = torch.repeat_interleave(value, dim=1, repeats=num_groups)
 
     # all-to-all: [bs, heads, seq_local, head_dim] -> [bs, heads/cp, full_seq, head_dim]
-    q = SeqAllToAll4D.apply(group, query, 1, 2)
-    k = SeqAllToAll4D.apply(group, key, 1, 2)
-    v = SeqAllToAll4D.apply(group, value, 1, 2)
+    full_seq = query.shape[2] * cp_size
+    if _HAS_MINDSPEED_A2A:
+        q = _ms_gather_seq_scatter_heads(query, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+        k = _ms_gather_seq_scatter_heads(key, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+        v = _ms_gather_seq_scatter_heads(value, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+    else:
+        q = SeqAllToAll4D.apply(group, query, 1, 2)
+        k = SeqAllToAll4D.apply(group, key, 1, 2)
+        v = SeqAllToAll4D.apply(group, value, 1, 2)
     full_seq = q.shape[2]
 
     # 直接建全长纯 causal mask（参考 MindSpeed：triu(ones, diagonal=1)）
@@ -173,7 +189,10 @@ def new_eager_attn_forward(
 
     attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
     # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
-    output = SeqAllToAll4D.apply(group, attn_output, 1, 2)
+    if _HAS_MINDSPEED_A2A:
+        output = _ms_gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
+    else:
+        output = SeqAllToAll4D.apply(group, attn_output, 1, 2)
     return output, None
 
 
