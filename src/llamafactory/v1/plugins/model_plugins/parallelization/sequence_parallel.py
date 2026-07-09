@@ -32,17 +32,11 @@ from .ulysses import (
     get_ulysses_sequence_parallel_world_size,
     set_ulysses_sequence_parallel_group,
 )
-from .seq_comm import SeqAllToAll4D
-
-# 尝试导入 MindSpeed 的 all-to-all 接口（NPU 环境可用）；不可用时回退 SeqAllToAll4D
-try:
-    from mindspeed_llm.fsdp2.distributed.context_parallel.ulysses_context_parallel.utils import (
-        gather_heads_scatter_seq as _ms_gather_heads_scatter_seq,
-        gather_seq_scatter_heads as _ms_gather_seq_scatter_heads,
-    )
-    _HAS_MINDSPEED_A2A = True
-except Exception:
-    _HAS_MINDSPEED_A2A = False
+from .seq_comm import (
+    SeqAllToAll4D,
+    gather_heads_scatter_seq,
+    gather_seq_scatter_heads,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -160,8 +154,7 @@ def new_eager_attn_forward(
     if not getattr(new_eager_attn_forward, "_confirmed", False):
         new_eager_attn_forward._confirmed = True
         if dist.is_initialized() and dist.get_rank() == 0:
-            a2a = "MindSpeed gather_seq_scatter_heads" if _HAS_MINDSPEED_A2A else "SeqAllToAll4D"
-            print(f"[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: {a2a}", flush=True)
+            print("[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: gather_seq_scatter_heads (MindSpeed all_to_all_single)", flush=True)
 
     # GQA 预复制（和 FA2 路径、MindSpeed 一致）
     num_attention_heads = module.config.num_attention_heads
@@ -173,14 +166,9 @@ def new_eager_attn_forward(
 
     # all-to-all: [bs, heads, seq_local, head_dim] -> [bs, heads/cp, full_seq, head_dim]
     full_seq = query.shape[2] * cp_size
-    if _HAS_MINDSPEED_A2A:
-        q = _ms_gather_seq_scatter_heads(query, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
-        k = _ms_gather_seq_scatter_heads(key, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
-        v = _ms_gather_seq_scatter_heads(value, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
-    else:
-        q = SeqAllToAll4D.apply(group, query, 1, 2)
-        k = SeqAllToAll4D.apply(group, key, 1, 2)
-        v = SeqAllToAll4D.apply(group, value, 1, 2)
+    q = gather_seq_scatter_heads(query, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+    k = gather_seq_scatter_heads(key, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
+    v = gather_seq_scatter_heads(value, seq_dim=2, head_dim=1, gather_size=full_seq, group=group)
     full_seq = q.shape[2]
 
     # mask: 用传进来的 attention_mask 重建全长 4D causal+padding（还原，不用纯 causal）
@@ -189,10 +177,7 @@ def new_eager_attn_forward(
 
     attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
     # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
-    if _HAS_MINDSPEED_A2A:
-        output = _ms_gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
-    else:
-        output = SeqAllToAll4D.apply(group, attn_output, 1, 2)
+    output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
     return output, None
 
 
