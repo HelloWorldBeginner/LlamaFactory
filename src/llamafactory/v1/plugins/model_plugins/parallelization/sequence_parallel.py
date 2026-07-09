@@ -144,6 +144,10 @@ def new_eager_attn_forward(
     重建全长 4D mask 后调原始 eager，输出 all-to-all 回来。
     """
     cp_size = get_ulysses_sequence_parallel_world_size(group)
+    if not getattr(new_eager_attn_forward, "_confirmed", False):
+        new_eager_attn_forward._confirmed = True
+        if dist.is_initialized() and dist.get_rank() == 0:
+            print("[CP] new_eager_attn_forward 已被调用 —— eager CP 生效", flush=True)
     # all-to-all: [bs, heads, seq_local, head_dim] -> [bs, heads/cp, full_seq, head_dim]
     q = SeqAllToAll4D.apply(group, query, 1, 2)
     k = SeqAllToAll4D.apply(group, key, 1, 2)
