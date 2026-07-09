@@ -76,26 +76,53 @@ def new_flash_attn_forward(
                 key_states = torch.repeat_interleave(key_states, dim=2, repeats=num_groups)
                 value_states = torch.repeat_interleave(value_states, dim=2, repeats=num_groups)
 
-        dist_attn = UlyssesAttention(sequence_process_group=group, attn_fn=attn_fn)
-        # Pop kwargs that UlyssesAttention handles explicitly, forward the rest
-        # (sliding_window, softcap, etc.) to attn_fn so CP attention matches non-CP.
-        position_ids = kwargs.pop("position_ids", None)
-        softmax_scale = kwargs.pop("softmax_scale", None)
-        kwargs.pop("query_length", None)  # HF passes local length; we use global length below
-        attn_output = dist_attn(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            query_length=query_states.shape[1] * sequence_parallel_size,
-            deterministic=deterministic,
-            dropout_p=dropout,
-            causal=is_causal,
-            position_ids=position_ids,
-            softmax_scale=softmax_scale,
-            target_dtype=target_dtype,
-            **kwargs,
-        )
+        use_ms = os.environ.get("CP_A2A", "mindspeed") != "seqalltoall"
+        if not getattr(new_flash_attn_forward, "_confirmed", False):
+            new_flash_attn_forward._confirmed = True
+            if dist.is_initialized() and dist.get_rank() == 0:
+                a2a = "MindSpeed all_to_all_single" if use_ms else "SeqAllToAll4D"
+                print(f"[CP] new_flash_attn_forward —— FA2 CP 生效，通信算子: {a2a}", flush=True)
+
+        if use_ms:
+            # MindSpeed all-to-all（FA2 输入 [bs, seq_local, heads, head_dim]）
+            full_seq = query_states.shape[1] * sequence_parallel_size
+            q = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2, gather_size=full_seq, group=group)
+            k = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2, gather_size=full_seq, group=group)
+            v = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2, gather_size=full_seq, group=group)
+            position_ids = kwargs.pop("position_ids", None)
+            softmax_scale = kwargs.pop("softmax_scale", None)
+            kwargs.pop("query_length", None)
+            attn_output = attn_fn(
+                q, k, v, attention_mask,
+                query_length=full_seq,
+                is_causal=is_causal,
+                dropout=dropout,
+                position_ids=position_ids,
+                softmax_scale=softmax_scale,
+                deterministic=deterministic,
+                target_dtype=target_dtype,
+                **kwargs,
+            )
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
+        else:
+            dist_attn = UlyssesAttention(sequence_process_group=group, attn_fn=attn_fn)
+            position_ids = kwargs.pop("position_ids", None)
+            softmax_scale = kwargs.pop("softmax_scale", None)
+            kwargs.pop("query_length", None)
+            attn_output = dist_attn(
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length=query_states.shape[1] * sequence_parallel_size,
+                deterministic=deterministic,
+                dropout_p=dropout,
+                causal=is_causal,
+                position_ids=position_ids,
+                softmax_scale=softmax_scale,
+                target_dtype=target_dtype,
+                **kwargs,
+            )
     else:
         raise NotImplementedError("Other sequence parallel modes are to be implemented.")
 
@@ -154,8 +181,10 @@ def new_eager_attn_forward(
     if not getattr(new_eager_attn_forward, "_confirmed", False):
         new_eager_attn_forward._confirmed = True
         if dist.is_initialized() and dist.get_rank() == 0:
-            a2a = "MindSpeed all_to_all_single" if os.environ.get("CP_A2A", "mindspeed") != "seqalltoall" else "SeqAllToAll4D"
-            print(f"[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: {a2a}", flush=True)
+            raw = os.environ.get("CP_A2A", "<not set>")
+            use_ms = raw != "seqalltoall"
+            a2a = "MindSpeed all_to_all_single" if use_ms else "SeqAllToAll4D"
+            print(f"[CP] new_eager_attn_forward —— eager CP 生效，CP_A2A={raw!r}, use_ms={use_ms}, 通信算子: {a2a}", flush=True)
 
     # 注意：eager 内部会 repeat_kv 处理 GQA，不能预复制 K/V（和 FA2 路径不同）
     # all-to-all 分别 scatter Q(heads=32) 和 K/V(kv_heads=8)，eager 内部 repeat_kv 对齐
