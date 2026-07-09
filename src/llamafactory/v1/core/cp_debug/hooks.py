@@ -362,9 +362,10 @@ class CPDebugManager:
         # 全 tensor → 正常记录（record 内 all-gather）
         self.record(f"model.{key}", val, step, hook_type="fwd_in")
 
-    def should_record(self) -> bool:
-        """是否应该记录当前 step"""
-        step = self.get_step()
+    def should_record(self, step: int = None) -> bool:
+        """是否应该记录指定 step（None=当前 step）。"""
+        if step is None:
+            step = self.get_step()
 
         if self.config.step_range is not None:
             if isinstance(self.config.step_range, tuple):
