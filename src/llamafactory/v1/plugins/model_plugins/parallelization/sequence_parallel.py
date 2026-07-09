@@ -28,8 +28,10 @@ from ....utils.types import ModelOutput
 from .ulysses import (
     UlyssesAttention,
     get_ulysses_sequence_parallel_group,
+    get_ulysses_sequence_parallel_world_size,
     set_ulysses_sequence_parallel_group,
 )
+from .seq_comm import SeqAllToAll4D
 
 
 logger = logging.get_logger(__name__)
@@ -95,10 +97,69 @@ def new_flash_attn_forward(
     return attn_output
 
 
+def _rebuild_full_eager_mask(attention_mask, group, cp_size, full_seq, dtype, device):
+    """从 CP 本地 4D mask 重建全长 4D causal+padding additive mask。
+
+    eager 用 4D additive mask（masked=fininfo.min，unmasked=0），无 is_causal 标志。
+    CP all-to-all 把 seq 拼回全长后，需要 [bs,1,full,full] 的 causal+padding mask。
+    本地 mask 只覆盖本地 seq 的 causal，无法直接拼；故：
+    1. 从本地 mask 抽出 padding key（对所有 query 都 mask 的 key）→ all-gather 拼全长 padding。
+    2. 重建全长 causal（triu）+ padding → 4D additive mask。
+    """
+    min_val = torch.finfo(dtype).min
+    if attention_mask is not None:
+        # attention_mask: [bs,1,seq_local,seq_local]；padding key = 所有 query 都被 mask
+        pad_local = (attention_mask[:, 0] < 0).all(dim=1).to(torch.int64)  # [bs, seq_local]
+        bs = pad_local.shape[0]
+        gathered = [torch.empty_like(pad_local) for _ in range(cp_size)]
+        dist.all_gather(gathered, pad_local, group=group)
+        pad_full = torch.cat(gathered, dim=-1).to(torch.bool)  # [bs, full_seq]
+    else:
+        bs = 1
+        pad_full = torch.zeros((bs, full_seq), dtype=torch.bool, device=device)
+    causal = torch.triu(torch.full((full_seq, full_seq), min_val, dtype=dtype, device=device), diagonal=1)
+    pad_4d = torch.where(pad_full[:, None, None, :], min_val,
+                         torch.zeros((), dtype=dtype, device=device)).expand(bs, 1, full_seq, full_seq)
+    full_mask = torch.maximum(causal[None, None, :, :].expand(bs, 1, full_seq, full_seq), pad_4d)
+    return full_mask
+
+
+def new_eager_attn_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    attn_fn=None,
+    group=None,
+    **kwargs,
+):
+    """Ulysses CP 包装（eager 后端）。
+
+    eager 的 q/k/v 形状是 [bs, heads, seq, head_dim]（已 transpose）。
+    all-to-all: scatter heads (dim=1), gather seq (dim=2) → [bs, heads/cp, full_seq, head_dim]。
+    GQA 由 eager 内部 repeat_kv 处理（all-to-all 后 Q=heads/cp, KV=kv_heads/cp，repeat_kv 一致）。
+    重建全长 4D mask 后调原始 eager，输出 all-to-all 回来。
+    """
+    cp_size = get_ulysses_sequence_parallel_world_size(group)
+    # all-to-all: [bs, heads, seq_local, head_dim] -> [bs, heads/cp, full_seq, head_dim]
+    q = SeqAllToAll4D.apply(group, query, 1, 2)
+    k = SeqAllToAll4D.apply(group, key, 1, 2)
+    v = SeqAllToAll4D.apply(group, value, 1, 2)
+    full_seq = q.shape[2]
+    full_mask = _rebuild_full_eager_mask(attention_mask, group, cp_size, full_seq, q.dtype, q.device)
+    attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
+    # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
+    output = SeqAllToAll4D.apply(group, attn_output, 1, 2)
+    return output, None
+
+
 @SequenceParallelModelPlugin("ulysses").register()
 def apply_sequence_parallel(model, model_args):
-    # Replace _flash_attention_forward with new_flash_attn_forward
-    module = sys.modules[model.__module__]
+    # Replace attention forward with Ulysses CP wrapper, dispatched by _attn_implementation.
+    model_module = sys.modules[model.__module__]
     cp_size = model_args.get("cp_size", 1)
 
     set_ulysses_sequence_parallel_group(DistributedInterface().get_group(Dim.CP))
@@ -116,30 +177,51 @@ def apply_sequence_parallel(model, model_args):
         "num_key_value_heads must be divisible by cp_size"
     )
 
-    origin_attn = transformers.modeling_flash_attention_utils._flash_attention_forward
-    new_flash_attention_forward = partial(
-        new_flash_attn_forward,
-        group=get_ulysses_sequence_parallel_group(),
-        mode="ulysses",
-        attn_fn=origin_attn,
-        sequence_parallel_size=cp_size,
-        num_attention_heads=num_attention_heads,
-        num_key_value_heads=num_key_value_heads,
-    )
+    attn_impl = getattr(model.config, "_attn_implementation", "flash_attention_2")
+    group = get_ulysses_sequence_parallel_group()
 
-    for module_name, module in list(sys.modules.items()):
-        try:
-            if (
-                hasattr(module, "__file__")
-                and "transformers" in module.__file__
-                and getattr(module._flash_attention_forward, "__name__", "") == "_flash_attention_forward"
-            ):
-                module._flash_attention_forward = new_flash_attention_forward
-                logger.info_rank0(
-                    f"Replaced _flash_attention_forward in module {module_name} with new_flash_attn_forward for sequence parallel."
-                )
-        except (AttributeError, TypeError):
-            continue
+    if attn_impl == "flash_attention_2":
+        # FA2: patch _flash_attention_forward（integrations 的 flash_attention_forward 内部调它）
+        origin_attn = transformers.modeling_flash_attention_utils._flash_attention_forward
+        new_flash_attention_forward = partial(
+            new_flash_attn_forward,
+            group=group,
+            mode="ulysses",
+            attn_fn=origin_attn,
+            sequence_parallel_size=cp_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+        )
+        for module_name, mod in list(sys.modules.items()):
+            try:
+                if (
+                    hasattr(mod, "__file__")
+                    and "transformers" in mod.__file__
+                    and getattr(mod._flash_attention_forward, "__name__", "") == "_flash_attention_forward"
+                ):
+                    mod._flash_attention_forward = new_flash_attention_forward
+                    logger.info_rank0(
+                        f"Replaced _flash_attention_forward in module {module_name} with new_flash_attn_forward for sequence parallel."
+                    )
+            except (AttributeError, TypeError):
+                continue
+    elif attn_impl in ("eager",):
+        # eager: patch 模型模块的 eager_attention_forward（get_interface("eager", default) 用它）
+        origin_eager = getattr(model_module, "eager_attention_forward", None)
+        if origin_eager is None:
+            raise NotImplementedError(
+                f"CP eager needs `eager_attention_forward` in {model.__module__}; not found. "
+                "确认模型支持 eager 后端。"
+            )
+        new_eager_attention_forward = partial(new_eager_attn_forward, attn_fn=origin_eager, group=group)
+        model_module.eager_attention_forward = new_eager_attention_forward
+        logger.info_rank0(
+            f"Replaced eager_attention_forward in {model.__module__} with new_eager_attn_forward for sequence parallel."
+        )
+    else:
+        raise NotImplementedError(
+            f"Sequence parallel (Ulysses) 目前仅支持 flash_attention_2 / eager 后端，当前 _attn_implementation={attn_impl!r}"
+        )
 
 
 def padding_and_split_data(data, device_mesh=None):
