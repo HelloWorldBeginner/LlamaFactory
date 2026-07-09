@@ -157,13 +157,8 @@ def new_eager_attn_forward(
             a2a = "MindSpeed all_to_all_single" if os.environ.get("CP_A2A", "mindspeed") != "seqalltoall" else "SeqAllToAll4D"
             print(f"[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: {a2a}", flush=True)
 
-    # GQA 预复制（和 FA2 路径、MindSpeed 一致）
-    num_attention_heads = module.config.num_attention_heads
-    num_key_value_heads = module.config.num_key_value_heads
-    num_groups = num_attention_heads // num_key_value_heads
-    if num_groups > 1:
-        key = torch.repeat_interleave(key, dim=1, repeats=num_groups)
-        value = torch.repeat_interleave(value, dim=1, repeats=num_groups)
+    # 注意：eager 内部会 repeat_kv 处理 GQA，不能预复制 K/V（和 FA2 路径不同）
+    # all-to-all 分别 scatter Q(heads=32) 和 K/V(kv_heads=8)，eager 内部 repeat_kv 对齐
 
     # all-to-all: [bs, heads, seq_local, head_dim] -> [bs, heads/cp, full_seq, head_dim]
     full_seq = query.shape[2] * cp_size
@@ -184,6 +179,7 @@ def new_eager_attn_forward(
 
     attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
     # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
+    num_attention_heads = module.config.num_attention_heads
     if use_ms:
         output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1, gather_size=num_attention_heads, group=group)
     else:
