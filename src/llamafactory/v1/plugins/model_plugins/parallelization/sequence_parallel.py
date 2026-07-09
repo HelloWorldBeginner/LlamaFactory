@@ -117,10 +117,12 @@ def _rebuild_full_eager_mask(attention_mask, group, cp_size, full_seq, dtype, de
     else:
         bs = 1
         pad_full = torch.zeros((bs, full_seq), dtype=torch.bool, device=device)
-    causal = torch.triu(torch.full((full_seq, full_seq), min_val, dtype=dtype, device=device), diagonal=1)
-    pad_4d = torch.where(pad_full[:, None, None, :], min_val,
-                         torch.zeros((), dtype=dtype, device=device)).expand(bs, 1, full_seq, full_seq)
-    full_mask = torch.maximum(causal[None, None, :, :].expand(bs, 1, full_seq, full_seq), pad_4d)
+    # causal: 上三角 = masked；padding key = masked。用 bool OR + where，不能用 maximum
+    # （maximum(负数 min_val, 0) = 0，会冲掉 causal 掩码 → 无 causal → forward 全错）
+    causal_masked = torch.triu(torch.ones((full_seq, full_seq), dtype=torch.bool, device=device), diagonal=1)
+    pad_masked = pad_full[:, None, None, :].expand(bs, 1, full_seq, full_seq)
+    masked = causal_masked[None, None, :, :].expand(bs, 1, full_seq, full_seq) | pad_masked
+    full_mask = torch.where(masked, min_val, torch.zeros((), dtype=dtype, device=device))
     return full_mask
 
 
