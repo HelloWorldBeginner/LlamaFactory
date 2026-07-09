@@ -155,7 +155,9 @@ def new_eager_attn_forward(
     k = SeqAllToAll4D.apply(group, key, 1, 2)
     v = SeqAllToAll4D.apply(group, value, 1, 2)
     full_seq = q.shape[2]
-    full_mask = _rebuild_full_eager_mask(attention_mask, group, cp_size, full_seq, q.dtype, q.device)
+    # mask dtype 对齐 HF 原生（attention_mask.dtype），避免 bf16 vs fp32 系统性差异
+    mask_dtype = attention_mask.dtype if attention_mask is not None else q.dtype
+    full_mask = _rebuild_full_eager_mask(attention_mask, group, cp_size, full_seq, mask_dtype, q.device)
     attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
     # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
     output = SeqAllToAll4D.apply(group, attn_output, 1, 2)
