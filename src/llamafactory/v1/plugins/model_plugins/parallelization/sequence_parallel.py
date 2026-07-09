@@ -150,9 +150,9 @@ def new_eager_attn_forward(
 ):
     """Ulysses CP 包装（eager 后端）。
 
-    参考 MindSpeed-LLM 的 ulysses_cp_attention.py：
-    - all-to-all: scatter heads (dim=1), gather seq (dim=2) → [bs, heads/cp, full_seq, head_dim]。
-    - mask: 不用传进来的 local mask，直接建全长纯 causal（triu），避免 rebuild 的 dtype/padding 问题。
+    - all-to-all: 优先用 MindSpeed 的 gather_seq_scatter_heads / gather_heads_scatter_seq，
+      回退 SeqAllToAll4D。
+    - mask: 用传进来的 attention_mask 重建全长 4D causal+padding（_rebuild_full_eager_mask）。
     - GQA: 预复制 K/V（和 FA2 路径一致），all-to-all 后头数对齐。
     """
     cp_size = get_ulysses_sequence_parallel_world_size(group)
@@ -181,11 +181,9 @@ def new_eager_attn_forward(
         v = SeqAllToAll4D.apply(group, value, 1, 2)
     full_seq = q.shape[2]
 
-    # 直接建全长纯 causal mask（参考 MindSpeed：triu(ones, diagonal=1)）
-    # 不用传进来的 local mask，避免 rebuild 的 dtype/padding/all-gather 问题
-    min_val = torch.finfo(q.dtype).min
-    full_mask = torch.triu(torch.full((full_seq, full_seq), min_val, dtype=q.dtype, device=q.device), diagonal=1)
-    full_mask = full_mask[None, None, :, :].expand(q.shape[0], 1, full_seq, full_seq)
+    # mask: 用传进来的 attention_mask 重建全长 4D causal+padding（还原，不用纯 causal）
+    mask_dtype = attention_mask.dtype if attention_mask is not None else q.dtype
+    full_mask = _rebuild_full_eager_mask(attention_mask, group, cp_size, full_seq, mask_dtype, q.device)
 
     attn_output, _ = attn_fn(module, q, k, v, full_mask, scaling, dropout, **kwargs)
     # eager 内部 transpose(1,2) → [bs, full_seq, heads/cp, head_dim]；回程 scatter seq(dim1)、gather heads(dim2)
