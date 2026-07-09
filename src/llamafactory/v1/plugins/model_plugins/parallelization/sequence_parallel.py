@@ -159,7 +159,8 @@ def new_eager_attn_forward(
     if not getattr(new_eager_attn_forward, "_confirmed", False):
         new_eager_attn_forward._confirmed = True
         if dist.is_initialized() and dist.get_rank() == 0:
-            print("[CP] new_eager_attn_forward 已被调用 —— eager CP 生效", flush=True)
+            a2a = "MindSpeed gather_seq_scatter_heads" if _HAS_MINDSPEED_A2A else "SeqAllToAll4D"
+            print(f"[CP] new_eager_attn_forward 已被调用 —— eager CP 生效，通信算子: {a2a}", flush=True)
 
     # GQA 预复制（和 FA2 路径、MindSpeed 一致）
     num_attention_heads = module.config.num_attention_heads
