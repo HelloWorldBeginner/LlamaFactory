@@ -22,6 +22,7 @@ import transformers
 
 from ....accelerator.interface import Dim, DistributedInterface
 from ....utils import logging
+from ....utils.cp_dump import dump_token_stats
 from ....utils.plugin import BasePlugin
 from ....utils.types import ModelOutput
 from .ulysses import (
@@ -90,7 +91,7 @@ def apply_sequence_parallel(model, model_args):
     set_ulysses_sequence_parallel_group(DistributedInterface().get_group(Dim.CP))
 
     try:
-        num_attention_heads, num_key_value_heads = model.config.num_attention_heads, model.config.num_attention_heads
+        num_attention_heads, num_key_value_heads = model.config.num_attention_heads, model.config.num_key_value_heads
     except AttributeError:
         num_attention_heads, num_key_value_heads = (
             model.config.text_config.num_attention_heads,
@@ -137,15 +138,60 @@ def padding_and_split_data(data, device_mesh=None):
                 global_data_len = [torch.empty_like(data_len) for _ in range(cp_size)]
                 dist.all_gather(global_data_len, data_len, group=cp_group)
                 max_data_len = max(global_data_len)
-                pad_size = max_data_len - v.shape[-1] + (cp_size - max_data_len % cp_size) % cp_size
-                if k == "labels":
-                    pad_value = -100
-                elif k == "loss_weights":
-                    pad_value = 0.0
+                real_pad = max_data_len - v.shape[-1]
+                round_pad = (cp_size - max_data_len % cp_size) % cp_size
+
+                if k in ("labels", "shift_labels"):
+                    pad_data = F.pad(v, (0, real_pad + round_pad), value=-100)
+                elif k in ("loss_weights", "shift_loss_weights"):
+                    pad_data = F.pad(v, (0, real_pad + round_pad), value=0.0)
+                elif k == "attention_mask":
+                    # real_pad 段=0（真实 padding，被 mask），round_pad 段=1（补齐位，不被 mask）。
+                    # round 段填 1 保证 CP2 各 rank 的 attention_mask 对称（修复原版 round 段填 0 的不对称 bug）。
+                    pad_data = F.pad(v, (0, real_pad), value=0)
+                    if round_pad > 0:
+                        pad_data = F.pad(pad_data, (0, round_pad), value=1)
+                elif k == "position_ids":
+                    # real_pad 段=0；round_pad 段从【原始末位】续位（last_pos+1,2,...），与 round_pad_data 一致，
+                    # 避免 real_pad>0 时从 0 重启与真实 position 0 撞号。
+                    pad_data = F.pad(v, (0, real_pad), value=0)
+                    if round_pad > 0:
+                        last_pos = v[..., -1:]
+                        round_pos = last_pos + torch.arange(1, round_pad + 1, device=v.device, dtype=v.dtype)
+                        pad_data = torch.cat([pad_data, round_pos], dim=-1)
                 else:
-                    pad_value = 0
-                pad_data = F.pad(v, (0, pad_size), value=pad_value)
+                    pad_data = F.pad(v, (0, real_pad + round_pad), value=0)
+
                 data[k] = torch.chunk(pad_data, chunks=cp_size, dim=-1)[cp_rank].contiguous()
+    return data
+
+
+def round_pad_data(data, align_size=1):
+    """仅 round-pad 到 align_size 倍数（不切分），用于让 CP1（cp_size=1）数据形状对齐 CP2。
+
+    pad 值与 padding_and_split_data 的 round_pad 段一致：attention_mask=1、labels=-100、
+    position_ids 续位、loss_weights=0、其余 0。这些位置 causal 隔离、不参与 loss。
+    诊断用：CP1 设 env CP_ALIGN_ROUND_PAD=2 调用此函数，验证 round_pad 是否为精度差异来源。
+    """
+    if align_size <= 1:
+        return data
+    for k, v in data.items():
+        if isinstance(v, torch.Tensor) and v.ndim > 1:
+            round_pad = (align_size - v.shape[-1] % align_size) % align_size
+            if round_pad == 0:
+                continue
+            if k in ("labels", "shift_labels"):
+                data[k] = F.pad(v, (0, round_pad), value=-100)
+            elif k in ("loss_weights", "shift_loss_weights"):
+                data[k] = F.pad(v, (0, round_pad), value=0.0)
+            elif k == "attention_mask":
+                data[k] = F.pad(v, (0, round_pad), value=1)
+            elif k == "position_ids":
+                last_pos = v[..., -1:]
+                cont = last_pos + torch.arange(1, round_pad + 1, device=v.device, dtype=v.dtype)
+                data[k] = torch.cat([v, cont], dim=-1)
+            else:
+                data[k] = F.pad(v, (0, round_pad), value=0)
     return data
 
 
@@ -194,6 +240,8 @@ def sequence_parallel_loss(model, model_inputs):
     global_log_probs = dist.nn.all_gather(log_probs, group=cp_group)
     global_log_probs = torch.cat(global_log_probs, dim=1).contiguous()
     log_probs = global_log_probs[..., :-1].contiguous()
+
+    dump_token_stats(log_probs, logits, cp_rank=cp_rank, tag="cp2")
 
     loss = (-log_probs * shift_loss_weights).sum() / (shift_loss_weights.sum() + 1e-6)
 

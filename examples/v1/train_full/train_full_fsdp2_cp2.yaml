@@ -1,0 +1,34 @@
+model: /mnt/hf_weights/Qwen3-8B
+trust_remote_code: true
+model_class: llm
+
+template: qwen3_nothink
+flash_attn: flash_attention_2
+#flash_attn: eager
+
+# init_config:
+#   name: init_on_meta
+
+# FSDP Config
+dist_config:
+  name: fsdp2
+  dcp_path: null
+  # mp_shard_size: 8
+  # mp_relicate_size: 1
+  cp_mode: ulysses
+  cp_size: 2
+
+### data
+# train_dataset: data/v1_sft_demo.yaml
+
+train_dataset: data/alpaca_en_52k.yaml
+
+### training
+output_dir: outputs/test_ulysses_cp
+micro_batch_size: 1
+full_determinism: true
+cutoff_len: 2048
+learning_rate: 1.0e-4
+bf16: false
+#max_grad_norm: 1.0e9
+max_steps: 1000
