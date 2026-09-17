@@ -101,8 +101,9 @@ non-MTP CP). When MTP and CP are both enabled:
 - The MTP decoder layers go through the same globally-patched `_flash_attention_forward`
   as the main model, so they participate in Ulysses attention automatically. (Each MTP
   head is a `full_attention` layer, so it always uses `_flash_attention_forward`.)
-- `BaseTrainer.fit` routes to the `sequence_parallel_mtp_loss` plugin, which computes the
-  main-head CP loss (unchanged) plus the scaled MTP loss. The per-head MTP loss is
+- `SFTTrainer.compute_loss` routes to the `sequence_parallel_mtp_loss` plugin, which computes the
+  main-head CP loss (the same weighted-numerator reduction as `sequence_parallel_loss`) plus
+  the scaled MTP loss. The per-head MTP loss is
   computed on the full sequence by all-gathering `labels` / `loss_weights` / `log_probs`
   across the CP group (see `compute_mtp_loss` with `cp_group` in `mtp.py`), mirroring the
   single-head `sequence_parallel_loss` plugin.

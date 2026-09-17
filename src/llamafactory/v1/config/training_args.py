@@ -144,6 +144,10 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Log metrics every N optimizer steps."},
     )
+    chunk_loss_size: int | None = field(
+        default=None,
+        metadata={"help": "Maximum flattened token rows per Chunk Loss chunk. None disables Chunk Loss."},
+    )
     pref_loss: Literal["sigmoid", "orpo", "simpo"] = field(
         default="sigmoid",
         metadata={"help": "The type of DPO loss to use."},
@@ -173,6 +177,8 @@ class TrainingArguments:
         self.dist_config = get_plugin_config(self.dist_config)
         self.optim_config = get_plugin_config(self.optim_config)
         self.lr_scheduler_config = get_plugin_config(self.lr_scheduler_config)
+        if self.chunk_loss_size is not None and self.chunk_loss_size <= 0:
+            raise ValueError("`chunk_loss_size` must be positive.")
         try:
             from ..plugins.model_plugins.deepspeed_utils import register_deepspeed_dist_config
 

@@ -94,6 +94,11 @@ def _make_norms_dtype_safe(model: HFModel) -> int:
     return n
 
 
+def is_lora_model(model: HFModel) -> bool:
+    """Return whether PEFT LoRA layers have already been injected into the model."""
+    return any(isinstance(module, LoraLayer) for module in model.modules())
+
+
 def get_transformer_layer_cls(model: HFModel) -> set[type[nn.Module]]:
     classes: set[type[nn.Module]] = set()
     for module in model.modules():
@@ -123,7 +128,8 @@ def save_model(model: HFModel, output_dir: str, processor: Processor) -> None:
     if DistributedInterface().get_rank() == 0:
         logger.info("Gathering state dict for saving...")
 
-    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    lora_model = is_lora_model(model)
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=lora_model)
     state_dict = get_model_state_dict(model, options=options)
 
     # Drop MTP keys that share tensors with the base model (embedding / lm_head) so that
@@ -159,7 +165,8 @@ def save_checkpoint(model: HFModel, optimizer: torch.optim.Optimizer, ckpt_dir: 
         if DistributedInterface().get_rank() == 0:
             logger.info("Gathering state dict for saving additional HF format checkpoint...")
 
-        hf_options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        lora_model = is_lora_model(model)
+        hf_options = StateDictOptions(full_state_dict=True, cpu_offload=True, ignore_frozen_params=lora_model)
         hf_state_dict = get_model_state_dict(model, options=hf_options)
 
         # Drop shared MTP keys before save_pretrained (same reason as save_model).
@@ -232,9 +239,9 @@ class FSDP2Engine:
         )
 
     def is_lora_module_wrap(self, model) -> bool:
-        return any(isinstance(module, LoraLayer) for module in model.modules())
+        return is_lora_model(model)
 
-    def prepare_model(self, model: HFModel) -> HFModel:
+    def prepare_model(self, model: HFModel, ignored_params: set[nn.Parameter] | None = None) -> HFModel:
         if self.fsdp_mesh is None:
             logger.warning("No FSDP Mesh available, skipping FSDP wrapping.")
             return model
@@ -249,6 +256,11 @@ class FSDP2Engine:
         else:
             names = ", ".join(cls.__name__ for cls in transformer_layer_cls_to_wrap)
             logger.info(f"Applying per-layer FSDP to: {names}")
+
+        def _ignored_params_for(module: nn.Module) -> set[nn.Parameter] | None:
+            if not ignored_params:
+                return None
+            return ignored_params.intersection(module.parameters()) or None
 
         if self.is_lora_module_wrap(model):
             lora_modules = []
@@ -265,6 +277,7 @@ class FSDP2Engine:
                     reshard_after_forward=self.reshard_after_forward,
                     mp_policy=mp_policy,
                     offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+                    ignored_params=_ignored_params_for(module),
                 )
 
             logger.info("Applying FSDP wrap for LoRA layer separately.")
@@ -285,6 +298,7 @@ class FSDP2Engine:
                     reshard_after_forward=self.reshard_after_forward,
                     mp_policy=mp_policy,
                     offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+                    ignored_params=_ignored_params_for(module),
                 )
 
         # BaseTrainer is the single source of truth for gradient checkpointing.
@@ -313,6 +327,7 @@ class FSDP2Engine:
             reshard_after_forward=self.reshard_after_forward,
             mp_policy=mp_policy,
             offload_policy=CPUOffloadPolicy(pin_memory=self.pin_memory) if self.offload_params else None,
+            ignored_params=_ignored_params_for(model),
         )
 
         return model
@@ -372,6 +387,8 @@ class FSDP2Engine:
         init_mode = getattr(model, "_init_mode", "init_on_default")
 
         if init_mode == "init_on_rank0":
+            non_persistent_buffers = self._save_non_persistent_buffers(model) if self.rank == 0 else {}
+
             if getattr(model.config, "tie_word_embeddings", False):
                 model.tie_weights()
 
@@ -390,6 +407,13 @@ class FSDP2Engine:
             # Broadcast the full state dict from the global rank-0 process to all ranks in this group.
             options = StateDictOptions(full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True)
             set_model_state_dict(model, full_sd, options=options)
+            self._restore_non_persistent_buffers(model, non_persistent_buffers)
+            if self.world_size > 1:
+                for module in model.modules():
+                    for buffer_name in sorted(module._non_persistent_buffers_set):
+                        buffer = getattr(module, buffer_name, None)
+                        if buffer is not None:
+                            torch.distributed.broadcast(buffer, src=0)
 
             if self.rank == 0:
                 logger.info("init_on_rank0 sync complete.")

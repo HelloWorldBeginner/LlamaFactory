@@ -93,8 +93,8 @@ MTP 同样支持 Ulysses 上下文并行(CP)。CP 要求 `dist_config.name: fsdp
 - MTP decoder layer 会走与主模型相同的、全局 patch 过的 `_flash_attention_forward`,
   因此自动参与 Ulysses 注意力。(每个 MTP 头都是 `full_attention` 层,所以它总是走
   `_flash_attention_forward`。)
-- `BaseTrainer.fit` 会路由到 `sequence_parallel_mtp_loss` 插件,它计算主头的 CP 损失
-  (不变)加上缩放后的 MTP 损失。逐头 MTP 损失在完整序列上计算,方式是在 CP 组内
+- `SFTTrainer.compute_loss` 会路由到 `sequence_parallel_mtp_loss` 插件,它计算主头的 CP 损失
+  (与 `sequence_parallel_loss` 相同的加权分子归约)加上缩放后的 MTP 损失。逐头 MTP 损失在完整序列上计算,方式是在 CP 组内
   all-gather `labels` / `loss_weights` / `log_probs`(见 `mtp.py` 中带 `cp_group` 的
   `compute_mtp_loss`),与单头的 `sequence_parallel_loss` 插件保持一致。
 - MTP 的输入移位(`shift_input_ids_for_mtp`)是 CP 感知的:每个 rank 的块尾会用

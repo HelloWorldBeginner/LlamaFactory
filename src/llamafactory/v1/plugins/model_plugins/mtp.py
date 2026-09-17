@@ -537,6 +537,30 @@ def _patch_forward(model: "PreTrainedModel") -> None:
                 input_ids = kwargs.get("input_ids", args[0] if args else None)
                 attention_mask = kwargs.get("attention_mask", None)
                 position_ids = kwargs.get("position_ids", None)
+                # Under Ulysses context parallelism the sequence-parallel pre-hook splits
+                # the inputs only at the language-model boundary, so the outer kwargs
+                # still hold the full padded sequence while ``hidden`` covers the local
+                # chunk. Slice them to the local chunk (same chunking as
+                # ``split_sequence_tensor``) so they line up with the hidden states.
+                cp_size = 1
+                if dist.is_available() and dist.is_initialized():
+                    try:
+                        from .parallelization.ulysses import get_ulysses_sequence_parallel_world_size
+
+                        cp_size = get_ulysses_sequence_parallel_world_size()
+                    except Exception:
+                        cp_size = 1
+
+                if cp_size > 1:
+                    from .parallelization.ulysses import get_ulysses_sequence_parallel_rank
+
+                    cp_rank = get_ulysses_sequence_parallel_rank()
+                    if input_ids is not None:
+                        input_ids = input_ids.chunk(cp_size, dim=1)[cp_rank]
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.chunk(cp_size, dim=-1)[cp_rank]
+                    if position_ids is not None:
+                        position_ids = position_ids.chunk(cp_size, dim=-1)[cp_rank]
                 mtp_logits = mtp_block(
                     hidden,
                     input_ids=input_ids,

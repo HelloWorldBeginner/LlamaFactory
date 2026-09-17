@@ -257,7 +257,7 @@ class TrainingCheckpointCoordinator:
                 num_training_steps=self._t.num_training_steps,
             )
 
-        if self._dist_name in ("fsdp2", "deepspeed"):
+        if self._dist_name in ("fsdp2", "fsdpturbo", "deepspeed"):
             from ...plugins.trainer_plugins.distributed.interface import DistributedPlugin
 
             DistributedPlugin(self._dist_name).save_checkpoint(
@@ -313,7 +313,7 @@ class TrainingCheckpointCoordinator:
         self._t.global_step = metadata["global_step"]
         self._t._resume_epoch = metadata["epoch"]
 
-        if self._dist_name in ("fsdp2", "deepspeed"):
+        if self._dist_name in ("fsdp2", "fsdpturbo", "deepspeed"):
             from ...plugins.trainer_plugins.distributed.interface import DistributedPlugin
 
             DistributedPlugin(self._dist_name).load_checkpoint(

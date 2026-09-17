@@ -42,6 +42,7 @@ from hyper_parallel.integration.llamafactory.context_parallel import (
     get_dp_rank,
     shard_inputs_for_cp,
 )
+from hyper_parallel.integration.llamafactory.expert_parallel import ep_prepare_model
 from hyper_parallel.platform import get_platform
 from torch import nn
 
@@ -163,10 +164,11 @@ class HyperParallelTrainer(CustomSeq2SeqTrainer):
             raise ValueError("HyperParallel trainer requires Accelerate FSDP2 mode to be enabled.")
 
         self._cp_size = hp_args.cp_size
+        self._ep_size = hp_args.ep_size
         self._cp_rank = get_cp_rank(hp_args) if self._cp_size > 1 else 0
         self._dp_rank = get_dp_rank(hp_args) if self._cp_size > 1 else get_platform().get_rank()
 
-        # Prepare ref_model with the same CP + HSDP path as the train model.
+        # Prepare ref_model with the same CP + EP + HSDP path as the train model.
         self.ref_model = ref_model
         if self.ref_model is not None:
             self.ref_model = self._prepare_model_for_hyper_parallel(self.ref_model)
@@ -176,9 +178,11 @@ class HyperParallelTrainer(CustomSeq2SeqTrainer):
         self._accelerator_patches_active = False
 
     def _prepare_model_for_hyper_parallel(self, model: nn.Module) -> nn.Module:
-        """Apply CP runtime hooks before delegating to HyperParallel FSDP2 preparation."""
+        """Apply CP/EP preparation before delegating to HyperParallel FSDP2."""
         if self._cp_size > 1:
             model = cp_prepare_model(model, self.accelerator, self._hp_args)
+        if self._ep_size > 1:
+            model = ep_prepare_model(model, self.accelerator, self._hp_args)
         return fsdp2_prepare_model(self.accelerator, model, self._hp_args)
 
     def _activate_accelerator_patches(self) -> None:

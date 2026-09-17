@@ -147,11 +147,6 @@ class BaseTrainer:
         self.state.epoch = self._resume_epoch
 
         if self.args.cp_size > 1:
-            # qwen3.5 is not supported because of the different attention implementation, which will be supported in the future.
-            if model.config.model_type == "qwen3_5":
-                raise RuntimeError(
-                    "Sequence parallel is not supported for qwen3.5 model due to its different attention implementation, which will be supported in the future."
-                )
             from ..plugins.model_plugins.parallelization.sequence_parallel import SequenceParallelModelPlugin
 
             if model.config._attn_implementation != "flash_attention_2":
@@ -249,7 +244,12 @@ class BaseTrainer:
 
     @abstractmethod
     def compute_loss(self, batch: BatchInput) -> Tensor:
-        """Compute the scalar loss."""
+        """Compute the scalar loss.
+
+        Subclasses must handle sequence-parallel layout and loss aggregation when
+        `self.cp_size > 1`, or reject context parallelism during initialization.
+        The shared training loop does not dispatch sequence-parallel loss.
+        """
         ...
 
     def fit(self) -> None:
@@ -275,17 +275,7 @@ class BaseTrainer:
                 step_valid_tokens = DistributedInterface().all_reduce(step_valid_tokens, op=ReduceOp.SUM)
                 num_micro = len(micro_batches)
                 for i, micro_batch in enumerate(micro_batches):
-                    if self.args.cp_size > 1:
-                        from ..plugins.model_plugins.parallelization.sequence_parallel import (
-                            SequenceParallelLossPlugin,
-                        )
-
-                        if self._has_mtp():
-                            loss = SequenceParallelLossPlugin("sequence_parallel_mtp_loss")(self.model, micro_batch)
-                        else:
-                            loss = SequenceParallelLossPlugin("sequence_parallel_loss")(self.model, micro_batch)
-                    else:
-                        loss = self.compute_loss(micro_batch)
+                    loss = self.compute_loss(micro_batch)
                     mini_step_valid_tokens = compute_valid_tokens([micro_batch])
                     # fsdp uses mean reduction so we need to scale the loss by dp_size
                     loss = loss * mini_step_valid_tokens * self.dp_size / (step_valid_tokens + 1e-6)
@@ -302,19 +292,29 @@ class BaseTrainer:
                     # deepspeed: engine.step() already ran inside backward at the sync boundary
                     grad_norm = self._deepspeed_engine.get_grad_norm()
                 else:
-                    # FSDP2 shards params/grads across the fsdp mesh, so clip_grad_norm_ returns a
-                    # per-rank local shard norm (global / sqrt(shard_size)): reported grad_norm then
-                    # scales as 1/sqrt(dp_size) and the clip coefficient is applied per-shard. Reduce
-                    # to the true global norm first, then clip with it.
-                    grads = [p.grad for p in self.model.parameters() if p.grad is not None]
-                    total_norm = torch.nn.utils.get_total_norm(grads)
-                    if isinstance(total_norm, DTensor):
-                        # full_tensor all-reduces across the fsdp mesh (spans CP under default
-                        # mp_shard=world); a separate CP reduce would over-count by sqrt(cp_size).
-                        total_norm = total_norm.full_tensor()
-                    # pass a Tensor: clip_grads_with_norm_ clamps max_norm / (total_norm + 1e-6).
-                    torch.nn.utils.clip_grads_with_norm_(self.model.parameters(), self.args.max_grad_norm, total_norm)
-                    grad_norm = total_norm.item()
+                    dist_name = self.args.dist_config.name if self.args.dist_config else None
+                    if dist_name == "fsdpturbo":
+                        from ..plugins.trainer_plugins.distributed.interface import DistributedPlugin
+
+                        grad_norm = DistributedPlugin(dist_name).clip_grad_norm(self.model, self.args.max_grad_norm)
+                    else:
+                        # FSDP2 shards params/grads across the fsdp mesh, so clip_grad_norm_ returns a
+                        # per-rank local shard norm. Materialize the true global norm before clipping.
+                        grads = [p.grad for p in self.model.parameters() if p.grad is not None]
+                        total_norm = torch.nn.utils.get_total_norm(grads)
+                        if isinstance(total_norm, DTensor):
+                            # full_tensor all-reduces across the fsdp mesh (spans CP under default
+                            # mp_shard=world); a separate CP reduce would over-count by sqrt(cp_size).
+                            total_norm = total_norm.full_tensor()
+                        torch.nn.utils.clip_grads_with_norm_(
+                            self.model.parameters(), self.args.max_grad_norm, total_norm
+                        )
+                        grad_norm = total_norm.item()
+                        # Do not retain a full generation of gradient tensors across optimizer
+                        # steps. ``zero_grad(set_to_none=True)`` clears ``param.grad``, but this
+                        # local list would otherwise keep every old gradient alive until the next
+                        # assignment, doubling gradient memory during the following backward.
+                        del grads
 
                     if not torch.isfinite(torch.tensor(grad_norm)):  # type: ignore # pyright: ignore [reportUnknownReturnType]
                         logger.warning_rank0(f"Gradient norm is not finite: {grad_norm}")
@@ -376,7 +376,7 @@ class BaseTrainer:
 
     def save_model(self) -> None:
         """Save the model."""
-        if self.args.dist_config is not None and self.args.dist_config.name in ("deepspeed", "fsdp2"):
+        if self.args.dist_config is not None and self.args.dist_config.name in ("deepspeed", "fsdp2", "fsdpturbo"):
             from ..plugins.trainer_plugins.distributed.interface import DistributedPlugin
 
             DistributedPlugin(self.args.dist_config.name).save_model(
