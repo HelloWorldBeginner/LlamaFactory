@@ -113,8 +113,10 @@ flash_attn: flash_attention_2
 dist_config:
   name: fsdp2
   dcp_path: null
-  cp_mode: ulysses
-  cp_size: 2
+
+# 顶层字段,不放在 dist_config 里。
+cp_mode: ulysses
+cp_size: 2
 ```
 
 CP 相关配置见 `examples/v1/train_full/train_full_mtp.yaml` 的 CP 部分。

@@ -123,8 +123,10 @@ flash_attn: flash_attention_2
 dist_config:
   name: fsdp2
   dcp_path: null
-  cp_mode: ulysses
-  cp_size: 2
+
+# Top-level fields, not inside dist_config.
+cp_mode: ulysses
+cp_size: 2
 ```
 
 See the CP section of `examples/v1/train_full/train_full_mtp.yaml`. CP is not supported
