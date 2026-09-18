@@ -101,6 +101,13 @@ def test_mtp_loss_and_backward(tiny_model):
     head0 = tiny_model.mtp.layers[str(config.num_hidden_layers)]
     assert head0.layer.self_attn.q_proj.weight.grad is not None
 
+    # Exhaustive: EVERY mtp parameter must participate in forward. A grafted-but-unused
+    # module (e.g. h_proj once left out of the block forward) never gets a gradient, so
+    # AdamW creates no state for it and DCP checkpoint/resume fails with
+    # "Missing key in checkpoint state_dict: state.mtp.<param>.step".
+    no_grad = [name for name, p in tiny_model.mtp.named_parameters() if p.requires_grad and p.grad is None]
+    assert not no_grad, f"mtp params without gradient (dead in forward?): {no_grad}"
+
 
 def test_mtp_head_offset(tiny_model):
     """Head k predicts token p + k + 2 from position p.

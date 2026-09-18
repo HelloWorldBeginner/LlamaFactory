@@ -265,8 +265,13 @@ class MultiTokenPredictionBlock(nn.Module):
         position_embeddings = self.rotary_emb(input_embeds, position_ids=position_ids)
         cache_position = torch.arange(seq_len, device=hidden_states.device)
 
-        # Combine the main hidden state with the next-token embedding.
-        hidden_states = self.hnorm(hidden_states) + self.e_proj(self.enorm(input_embeds))
+        # Combine the main hidden state with the next-token embedding: both sides are
+        # normed and projected (h_proj on the hidden side, e_proj on the embed side),
+        # mirroring the MindSpeed-LLM MTP block. h_proj MUST be applied — leaving it out
+        # makes it a dead parameter (no gradient), which breaks optimizer-state
+        # checkpointing (AdamW creates no state for grad-less params, so DCP checkpoints
+        # miss its keys and resume fails with "Missing key ... state.mtp.h_proj.weight.step").
+        hidden_states = self.h_proj(self.hnorm(hidden_states)) + self.e_proj(self.enorm(input_embeds))
 
         all_mtp_logits: list[torch.Tensor] = []
         for layer_idx in range(self.num_layers):
